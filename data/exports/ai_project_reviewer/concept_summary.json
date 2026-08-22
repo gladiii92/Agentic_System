@@ -1,0 +1,85 @@
+{
+  "project_name": "AI_Project_Reviewer",
+  "concept_text": "AI Project Reviewer ist ein internes Tool zur automatisierten Analyse und Bewertung von Python-Code durch die Integration von KI-Technologien wie FastAPI, Jinja2, Pydantic, Pytest, SQLAlchemy und Typer. Es kombiniert strukturiertes Projektscanning, lokale Voranalyse mit Ollama, deterministische statische Analysetools und Persistenz von Findings über Zeit, um Code-Review, Architekturprüfung und Fortschrittsmessung zu verbessern. Das Tool dient als fokussiertes Review-Framework für aktuelle und zukünftige Projekte und zielt darauf ab, die Qualität und Geschwindigkeit der Entwicklung anderer Produkte und Systeme zu steigern.",
+  "document_summaries": [
+    {
+      "path": "AI_Project_Reviewer.md",
+      "summary": "Der AI_Project_Reviewer ist ein internes Produkt, das die Code-Reviews durch die Integration von KI-Technologien wie FastAPI, Jinja2, Pydantic, Pytest, SQLAlchemy und Typer unterstützt. Er dient der automatisierten Analyse und Bewertung von Python-Code, um Fehler, Stilprobleme und potenzielle Sicherheitsrisiken zu identifizieren und zu beheben."
+    },
+    {
+      "path": "FEATURES.md",
+      "summary": "Das Dokument \"FEATURES.md\" beschreibt die geplanten Kernfeatures des AI Project Reviewer, ein Tool zur Überprüfung von AI-Projekten. Es umfasst verschiedene Aspekte wie die Erkennung von Projektstruktur, Sprachen und Frameworks, die Kontextanalyse, eine schnelle Voranalyse mit Ollama, die Speicherung von Findings und die Integrierung von statischen Analysetools."
+    },
+    {
+      "path": "HANDOVER_2026-08-22_Obsidian_Sync_Abschluss.md",
+      "summary": "Das Dokument beschreibt den Abschluss der Entwicklung und Verifizierung des Obsidian-Sync-Baustein (`obsidian_export.py` + CLI-Befehle) für den AI Project Reviewer. Es löst zwei offene Probleme: das Bereitstellen von Inhalts-Snippets anstelle von Dateipfaden und das Verwenden eines Tkinter-Fensters für den Antwort-Rückfluss anstelle von Dateien oder interaktiver Eingabe. Die Lösung wurde mit echten Testläufen verifiziert und ist nun fertig und real getestet."
+    },
+    {
+      "path": "METRICS.md",
+      "summary": "Das Dokument \"METRICS.md\" definiert die Metriken, mit denen der Nutzen des AI Project Reviewer Tools bewertet wird. Es zielt darauf ab, die tatsächliche Nutzbarkeit, die Verbesserungen und die Zeitersparnis des Tools in echten Projekten zu quantifizieren."
+    },
+    {
+      "path": "PRODUCT.md",
+      "summary": "AI Project Reviewer ist ein lokales Tool zur Analyse eigener Softwareprojekte, das strukturiertes Projektscanning, lokale Voranalyse mit Ollama, deterministische Static Analysis und Persistenz von Findings über Zeit kombiniert, um Code-Review, Architekturprüfung und Fortschrittsmessung zu verbessern. Es dient als fokussiertes internes Review-Framework für aktuelle und zukünftige Projekte."
+    },
+    {
+      "path": "ROADMAP.md",
+      "summary": "Das Dokument beschreibt den Roadmap für ein AI-Projekt-Reviewer-Framework, das beliebige Softwareprojekte analysiert, mit Ollama eine strukturierte Vorprüfung durchführt, Findings speichert und daraus hochwertige Review-Prompts für ChatGPT generiert. Der Roadmap umfasst Phasen für Scanner, Context Builder, FIS-Sync und Ollama-Integration, mit jeweils spezifischen Ziele und Umfangen."
+    },
+    {
+      "path": "STRATEGY.md",
+      "summary": "AI Project Reviewer ist ein internes Werkzeug, das die Qualität und Geschwindigkeit der Entwicklung anderer Produkte und Systeme verbessert, indem es Codekontext strukturiert, wiederkehrende Reviewarbeit standardisiert und den Review-Fortschritt über Zeit sichtbar macht. Das Ziel ist ein kleines, robustes, lokales Review-System, das auf echten Projekten funktioniert und später erweitert werden kann, um die Review-Qualität und den Entwicklungsfortschritt über mehrere Projekte hinweg zu steigen."
+    },
+    {
+      "path": "Worklog_2026-07-31.md",
+      "summary": "Das Dokument beschreibt die Abschlussphase 1 und 2 eines AI-Projekts, bei der der Scanner-Fundament stabilisiert wurde, der JSON-Scan-Output verbessert und der Context Builder gezielter Kontext bereitstellt. Der nächste Schritt ist die Integration von Ollama."
+    },
+    {
+      "path": "Worklog_2026-08-02.md",
+      "summary": "Das Dokument beschreibt die Abschlussphase 2.5 des AI-Projekts, die sich auf die Verbesserung der FIS-Synchronisierung und Multi-Projekt-Sicherheit konzentriert. Es enthält die Identifikation und Korrektur von Bugs, die Verbesserung der Architektur, die Refactoring von Code und die Durchführung von Tests, um sicherzustellen, dass das System deterministisch und nachvollziehbar funktioniert."
+    },
+    {
+      "path": "Worklog_2026-08-03.md",
+      "summary": "Das Dokument beschreibt die Abschlussphase 3 eines AI-Projekts, die sich mit der Integration eines lokalen Ollama-Modells und der Erstellung strukturierter Vorreview-Findings befasst. Es enthält die Entwicklung neuer Komponenten wie `ollama_client.py`, `prompts/reviewer_prompt.py`, `models.py`, `findings_parser.py` und die Erweiterung der `review`-CLI-Command. Die Phase ist strukturell abgeschlossen und vollständig testabgedeckt, aber noch nicht real gegen einen laufenden Ollama-Server verifiziert."
+    },
+    {
+      "path": "Worklog_2026-08-10.md",
+      "summary": "Das Dokument beschreibt die Abschlussphase 5 eines AI-Projekts, die sich mit der Integration von Ruff (Code-Qualität) und Bandit (Sicherheits-Muster) in das bestehende Finding-Modell befasst. Es erläutert die hinzugefügten Module, Konfigurationsänderungen und die CLI-Erweiterung, um Ruff und Bandit nacheinander auszuführen und die Findings zu verwalten."
+    },
+    {
+      "path": "Worklog_2026-08-19.md",
+      "summary": "Das Dokument beschreibt die Abschlussarbeit aller offenen Realtest-Punkte aus Phase 3, 4 und 5 eines AI-Projekts, einschließlich der Behebung eines kritischen Fehlers im Diff-Idempotenz-Test. Es dient als Vorbereitung für die nächste Phase 6 des Projekts."
+    },
+    {
+      "path": "Worklog_2026-08-19_Phase_6.md",
+      "summary": "Das Dokument beschreibt die Umsetzung der Phase 6 eines AI-Projekts, einschließlich der Implementierung eines neuen Moduls für die ChatGPT-Prompt-Generierung, der Verbesserung der `load_findings()`-Funktion und der Erstellung eines neuen CLI-Commands für den Export von Prompts. Es handelt sich um eine iterative Verbesserung des Projekts durch die Behebung von Fehlern und die Vorbereitung auf die nächste Phase."
+    },
+    {
+      "path": "Worklog_2026-08-20_Phase_6_5.md",
+      "summary": "Das Dokument beschreibt die Umsetzung der Phase 6.5 eines AI-Projekts, die sich auf die Automatisierung des Dateiwachers, Tray-Icons und Benachrichtigungen konzentriert. Es handelt sich um eine robuste Cross-Source-Deduplizierung zwischen Ruff und Bandit sowie die Behebung von drei echten Bugs."
+    },
+    {
+      "path": "Worklog_2026-08-20_Phase_7.md",
+      "summary": "Das Dokument beschreibt die Umsetzung der Phase 7 eines AI-Projekts, die sich auf den Schließen des Feedback-Loops konzentriert. Es umfasst die Implementierung eines strukturierten ChatGPT-Antwortformats, automatischen Parsings, Status-Updates, automatischen Re-Scans und eines interaktiven Tkinter-Fensters für den Watch-Modus. Zudem wurden Noise-Filter-Erweiterungen und Cross-Projekt-Bugfixes in `ruff_runner.py` durchgeführt."
+    }
+  ],
+  "generated_at": "2026-08-22T14:17:28.597879+00:00",
+  "source_file_mtimes": {
+    "G:\\DAVID\\Desktop\\GitHub\\Founder_Intelligence_System\\04_PRODUCT_OS\\01_PRODUCTS\\AI_PROJECT_REVIEWER\\AI_Project_Reviewer.md": 1787401092.9147463,
+    "G:\\DAVID\\Desktop\\GitHub\\Founder_Intelligence_System\\04_PRODUCT_OS\\01_PRODUCTS\\AI_PROJECT_REVIEWER\\FEATURES.md": 1787149355.5597844,
+    "G:\\DAVID\\Desktop\\GitHub\\Founder_Intelligence_System\\04_PRODUCT_OS\\01_PRODUCTS\\AI_PROJECT_REVIEWER\\HANDOVER_2026-08-22_Obsidian_Sync_Abschluss.md": 1787401678.9718623,
+    "G:\\DAVID\\Desktop\\GitHub\\Founder_Intelligence_System\\04_PRODUCT_OS\\01_PRODUCTS\\AI_PROJECT_REVIEWER\\METRICS.md": 1787401297.8868957,
+    "G:\\DAVID\\Desktop\\GitHub\\Founder_Intelligence_System\\04_PRODUCT_OS\\01_PRODUCTS\\AI_PROJECT_REVIEWER\\PRODUCT.md": 1787149355.4927843,
+    "G:\\DAVID\\Desktop\\GitHub\\Founder_Intelligence_System\\04_PRODUCT_OS\\01_PRODUCTS\\AI_PROJECT_REVIEWER\\ROADMAP.md": 1787149355.4597845,
+    "G:\\DAVID\\Desktop\\GitHub\\Founder_Intelligence_System\\04_PRODUCT_OS\\01_PRODUCTS\\AI_PROJECT_REVIEWER\\STRATEGY.md": 1787401277.6707492,
+    "G:\\DAVID\\Desktop\\GitHub\\Founder_Intelligence_System\\04_PRODUCT_OS\\01_PRODUCTS\\AI_PROJECT_REVIEWER\\Worklog_2026-07-31.md": 1787149355.3537853,
+    "G:\\DAVID\\Desktop\\GitHub\\Founder_Intelligence_System\\04_PRODUCT_OS\\01_PRODUCTS\\AI_PROJECT_REVIEWER\\Worklog_2026-08-02.md": 1787149355.286786,
+    "G:\\DAVID\\Desktop\\GitHub\\Founder_Intelligence_System\\04_PRODUCT_OS\\01_PRODUCTS\\AI_PROJECT_REVIEWER\\Worklog_2026-08-03.md": 1787149355.3177865,
+    "G:\\DAVID\\Desktop\\GitHub\\Founder_Intelligence_System\\04_PRODUCT_OS\\01_PRODUCTS\\AI_PROJECT_REVIEWER\\Worklog_2026-08-10.md": 1787149355.2467852,
+    "G:\\DAVID\\Desktop\\GitHub\\Founder_Intelligence_System\\04_PRODUCT_OS\\01_PRODUCTS\\AI_PROJECT_REVIEWER\\Worklog_2026-08-19.md": 1787154078.0307758,
+    "G:\\DAVID\\Desktop\\GitHub\\Founder_Intelligence_System\\04_PRODUCT_OS\\01_PRODUCTS\\AI_PROJECT_REVIEWER\\Worklog_2026-08-19_Phase_6.md": 1787157730.6064327,
+    "G:\\DAVID\\Desktop\\GitHub\\Founder_Intelligence_System\\04_PRODUCT_OS\\01_PRODUCTS\\AI_PROJECT_REVIEWER\\Worklog_2026-08-20_Phase_6_5.md": 1787238952.2494493,
+    "G:\\DAVID\\Desktop\\GitHub\\Founder_Intelligence_System\\04_PRODUCT_OS\\01_PRODUCTS\\AI_PROJECT_REVIEWER\\Worklog_2026-08-20_Phase_7.md": 1787296566.9809828
+  },
+  "model": "qwen2.5-coder:latest"
+}
