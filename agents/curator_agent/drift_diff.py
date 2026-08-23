@@ -1,21 +1,24 @@
 """
 agents/curator_agent/drift_diff.py
 
-Dritter Baustein des Curator-Agenten (Phase 1). Zweck: rein deterministischer
-Vorab-Check zwischen zwei ConceptSummary-Staenden (vorheriger Snapshot vs.
-aktueller Lauf), ANALOG zum Muster aus AI_Project_Reviewer/sync_fis.py
-(diff_snapshots-Funktion) -- dort werden Datei-Strukturmetriken verglichen,
-hier vergleichen wir die Textinhalte pro Dokument.
+Dritter Baustein des Curator-Agenten (Phase 1), Schicht 1 der Evaluator-
+Kaskade (siehe evaluator_agent/README.md fuer die Gesamt-Uebersicht der
+Kaskade). Zweck: rein deterministischer Vorab-Check zwischen zwei
+ConceptSummary-Staenden (vorheriger Snapshot vs. aktueller Lauf), ANALOG
+zum Muster aus AI_Project_Reviewer/sync_fis.py (diff_snapshots-Funktion).
 
-WICHTIG -- Rollentrennung (siehe Chat-Verlauf 2026-08-22/23):
-Dieses Modul faellt bewusst KEIN inhaltliches Urteil ("widerspricht
-ROADMAP.md dem echten Stand?") -- das braucht ein LLM (Ollama) und ist ein
-spaeterer Baustein. Dieses Modul erkennt nur, WELCHE Dokumente sich
-ueberhaupt textuell veraendert haben ODER deren zugrunde liegende Datei
-sich veraendert hat (mtime), seit dem letzten Snapshot -- also die
-Kandidatenliste dafuer, WAS ueberhaupt an den LLM-Check weitergereicht
-werden muss. Das spart spaeter unnoetige Ollama-Aufrufe fuer Dokumente,
-die sich offensichtlich gar nicht veraendert haben.
+WICHTIG -- Ausloeser-Logik geaendert am 2026-08-23 (siehe Chat-Verlauf,
+Testlauf mit 13 Kandidaten, davon 11 reine Ollama-Formulierungsvarianz):
+Frueher loeste JEDE Text-Ungleichheit zwischen previous_summary und
+current_summary einen Kandidaten aus. Das war zu grosszuegig, weil Ollama
+bei jedem Lauf leicht anders formuliert, OHNE dass sich der Inhalt
+aendert (siehe arXiv-Recherche zu "semantic drift" bei gleichbleibender
+Bedeutung, Chat-Verlauf). NEU: alleiniger deterministischer Ausloeser ist
+die Datei-mtime (Best-Practice-Empfehlung: "cheap deterministic tests
+first", siehe Recherche 2026-08-23). Der Text-Gleichheits-Status wird
+weiterhin mitgefuehrt (summary_text_changed), aber NUR als Information
+fuer die naechste Schicht (embedding_filter.py), nicht mehr als eigener
+Ausloeser.
 """
 
 from __future__ import annotations
@@ -28,14 +31,15 @@ from agents.curator_agent.concept_loader import ConceptSummary
 
 @dataclass(frozen=True)
 class DriftCandidate:
-    """Ein Dokument, das sich seit dem letzten Snapshot veraendert hat oder
-    neu hinzugekommen ist -- Kandidat fuer den naechsten Schritt (LLM-
-    gestuetzter Drift-Check, spaeterer Baustein)."""
+    """Ein Dokument, dessen Quelldatei sich seit dem letzten Snapshot
+    nachweislich veraendert hat (mtime) oder das neu hinzugekommen ist --
+    Kandidat fuer Schicht 2 (Embedding-Aehnlichkeit, embedding_filter.py)."""
 
     filename: str
     reason: str
     previous_summary: str | None
     current_summary: str
+    summary_text_changed: bool
 
 
 @dataclass(frozen=True)
@@ -50,17 +54,9 @@ def diff_concept_summaries(
     previous: ConceptSummary | None,
     current: ConceptSummary,
 ) -> DriftDiffResult:
-    """Rein deterministischer Vergleich, kein LLM-Aufruf (siehe Modul-
-    Docstring). Vorbild: diff_snapshots() in AI_Project_Reviewer/sync_fis.py.
-
-    Erkennt drei Faelle pro Dokument:
-    - neu hinzugekommen seit letztem Snapshot
-    - summary-Text hat sich veraendert (Ollama hat beim letzten Lauf etwas
-      anderes zusammengefasst -- deutet auf echten Inhaltswechsel hin)
-    - mtime der Quelldatei hat sich veraendert, OBWOHL die summary identisch
-      blieb (moeglicher Hinweis auf eine Ollama-Zusammenfassung, die zu
-      grob ist, um eine kleine, aber relevante Aenderung zu erfassen --
-      bewusst trotzdem als Kandidat markiert, nicht verworfen)
+    """Rein deterministischer Vergleich, kein LLM-Aufruf. Ausloeser fuer
+    einen Kandidaten ist AUSSCHLIESSLICH: neues Dokument ODER veraenderte
+    mtime der Quelldatei (siehe Modul-Docstring, Entscheidung 2026-08-23).
     """
     if previous is None:
         return DriftDiffResult(
@@ -71,6 +67,7 @@ def diff_concept_summaries(
                     reason="Initialer Lauf -- kein Vorzustand vorhanden.",
                     previous_summary=None,
                     current_summary=doc.summary,
+                    summary_text_changed=True,
                 )
                 for doc in current.document_summaries
             ],
@@ -94,34 +91,22 @@ def diff_concept_summaries(
                     reason="Neues Dokument seit letztem Snapshot.",
                     previous_summary=None,
                     current_summary=current_summary,
+                    summary_text_changed=True,
                 )
             )
             continue
 
-        summary_changed = previous_summary != current_summary
         mtime_changed = _mtime_changed(previous, current, path)
+        summary_text_changed = previous_summary != current_summary
 
-        if summary_changed:
+        if mtime_changed:
             candidates.append(
                 DriftCandidate(
                     filename=path,
-                    reason="Ollama-Zusammenfassung hat sich seit letztem Snapshot veraendert.",
+                    reason="Quelldatei wurde seit letztem Snapshot veraendert (mtime).",
                     previous_summary=previous_summary,
                     current_summary=current_summary,
-                )
-            )
-        elif mtime_changed:
-            candidates.append(
-                DriftCandidate(
-                    filename=path,
-                    reason=(
-                        "Datei wurde seit letztem Snapshot veraendert (mtime), "
-                        "aber die Ollama-Zusammenfassung blieb identisch -- "
-                        "moeglicherweise eine zu grobe Zusammenfassung, bitte "
-                        "trotzdem pruefen."
-                    ),
-                    previous_summary=previous_summary,
-                    current_summary=current_summary,
+                    summary_text_changed=summary_text_changed,
                 )
             )
         else:
@@ -138,9 +123,6 @@ def diff_concept_summaries(
 
 
 def _mtime_changed(previous: ConceptSummary, current: ConceptSummary, doc_path: str) -> bool:
-    """Vergleicht source_file_mtimes ueber den Dateinamen (nicht den vollen,
-    absoluten Pfad), weil sich der Vault-Root-Praefix theoretisch aendern
-    kann (z.B. Repo verschoben), der Dateiname selbst aber stabil bleibt."""
     previous_mtime = _mtime_for_filename(previous.source_file_mtimes, doc_path)
     current_mtime = _mtime_for_filename(current.source_file_mtimes, doc_path)
 

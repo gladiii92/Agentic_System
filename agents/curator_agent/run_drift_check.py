@@ -1,24 +1,23 @@
 """
 agents/curator_agent/run_drift_check.py
 
-Vierter Baustein / Orchestrator fuer Phase 1 (Curator-Agent, Teil 1).
-Fuehrt EINEN kompletten manuellen Curator-Durchlauf aus:
+Orchestrator fuer Phase 1 (Curator-Agent + Evaluator-Agent, komplette
+Kaskade). Fuehrt EINEN kompletten manuellen Durchlauf aus:
 
     1. Frischen concept_summary-Lauf ueber AI_Project_Reviewer anstossen
        und laden (concept_loader.py)
     2. Vorherigen eigenen Snapshot laden, falls vorhanden (snapshot_store.py)
-    3. Deterministischen Diff berechnen -- WELCHE Dokumente sind
-       Drift-Kandidaten? (drift_diff.py)
-    4. Aktuellen Stand als neuen Snapshot sichern (snapshot_store.py)
-    5. Ergebnis in Klartext ausgeben (KEIN LLM-Urteil, KEIN Schreiben ins
-       FIS-Vault -- das sind spaetere Bausteine, siehe Chat-Verlauf)
+    3. Schicht 1 -- deterministischer mtime-Diff (drift_diff.py)
+    4. Schicht 2 -- Embedding-Aehnlichkeits-Filter (embedding_filter.py)
+    5. Schicht 3 -- LLM-Judge pro durchgelassenem Kandidaten (evaluator.py)
+    6. Vier-Kriterien-Scoring pro Judgment, NUR approved-Vorschlaege werden
+       dir angezeigt (evaluator.py score_drift_judgment_heuristically)
+    7. Aktuellen Stand als neuen Snapshot sichern (snapshot_store.py)
 
-Bewusst als eigenstaendiges, direkt ausfuehrbares Skript (kein Import in
-anderen Modulen vorausgesetzt), damit du es einfach manuell anstossen
-kannst (siehe Entscheidung "rein manueller Trigger", Chat-Verlauf
-2026-08-23). Spaetere Automatisierung (Cron/Task Scheduler) kann dieses
-Skript unveraendert per `python -m agents.curator_agent.run_drift_check`
-aufrufen.
+WICHTIG: Dieses Skript SCHREIBT NICHTS ins FIS-Vault. Es zeigt dir nur
+an, was der Evaluator freigegeben hat -- das tatsaechliche Schreiben der
+ROADMAP.md o.ae. ist ein spaeterer Baustein (Human-in-the-Loop-
+Bestaetigung + Schreibvorgang), bewusst noch nicht Teil dieser Phase.
 """
 
 from __future__ import annotations
@@ -30,20 +29,37 @@ from agents.curator_agent.concept_loader import (
     refresh_and_load,
 )
 from agents.curator_agent.drift_diff import diff_concept_summaries
+from agents.curator_agent.embedding_filter import filter_candidates
 from agents.curator_agent.snapshot_store import load_latest_snapshot, save_snapshot
+from agents.evaluator_agent.evaluator import (
+    EvaluatorError,
+    run_drift_judge,
+    score_drift_judgment_heuristically,
+)
 
-# TODO gemeinsam anpassen, falls Pfade abweichen (siehe config.py im Root
-# von Agentic_System -- perspektivisch sollten diese Konstanten von dort
-# importiert werden statt hier hart codiert zu sein; fuer den ersten
-# End-to-End-Test bewusst noch lokal gehalten, siehe Chat-Verlauf).
 AI_PROJECT_REVIEWER_REPO_PATH = Path(r"G:\DAVID\Desktop\GitHub\AI_Project_Reviewer")
 CURATOR_DATA_ROOT = Path(r"G:\DAVID\Desktop\GitHub\Agentic_System\data")
 TARGET_PROJECT_NAME = "AI_Project_Reviewer"
 
 
+def _recent_worklog_summaries(current_summary, exclude_filename: str) -> str:
+    """Baut den Zusatzkontext fuer den Judge-Prompt: Text aus allen
+    Worklog-Dokumenten AUSSER dem aktuell geprueften Dokument selbst.
+    Bewusst simple Heuristik ueber den Dateinamen ("Worklog" im Namen) --
+    reicht fuer Phase 1, kann spaeter verfeinert werden (z.B. echte
+    zeitliche Sortierung statt Namens-Heuristik)."""
+    parts = []
+    for doc in current_summary.document_summaries:
+        if doc.path == exclude_filename:
+            continue
+        if "worklog" in doc.path.lower():
+            parts.append(f"- {doc.path}: {doc.summary}")
+    return "\n".join(parts)
+
+
 def run() -> None:
-    print(f"Starte Curator-Durchlauf fuer Projekt: {TARGET_PROJECT_NAME}")
-    print("Schritt 1/4: Frischer concept_summary-Lauf (kann ca. 1 Minute dauern)...")
+    print(f"Starte Curator+Evaluator-Durchlauf fuer Projekt: {TARGET_PROJECT_NAME}")
+    print("Schritt 1/6: Frischer concept_summary-Lauf (kann ca. 1 Minute dauern)...")
 
     try:
         current_summary = refresh_and_load(
@@ -57,43 +73,88 @@ def run() -> None:
 
     print(f"  -> {len(current_summary.document_summaries)} Dokument(e) zusammengefasst.")
 
-    print("Schritt 2/4: Vorherigen Snapshot laden...")
+    print("Schritt 2/6: Vorherigen Snapshot laden...")
     previous_summary = load_latest_snapshot(CURATOR_DATA_ROOT, TARGET_PROJECT_NAME)
     if previous_summary is None:
         print("  -> Kein vorheriger Snapshot gefunden (erster Lauf fuer dieses Projekt).")
     else:
         print(f"  -> Vorheriger Snapshot vom {previous_summary.generated_at} geladen.")
 
-    print("Schritt 3/4: Deterministischen Drift-Diff berechnen...")
+    print("Schritt 3/6: Schicht 1 -- deterministischer mtime-Diff...")
     diff_result = diff_concept_summaries(previous=previous_summary, current=current_summary)
 
-    print("Schritt 4/4: Aktuellen Stand als neuen Snapshot sichern...")
     saved_path = save_snapshot(CURATOR_DATA_ROOT, TARGET_PROJECT_NAME, current_summary)
-    print(f"  -> Gespeichert unter: {saved_path}")
-
-    print()
-    print("=" * 70)
-    print("ERGEBNIS (rein deterministisch, noch KEIN LLM-Urteil)")
-    print("=" * 70)
+    print(f"  -> Snapshot gespeichert unter: {saved_path}")
 
     if diff_result.is_first_run:
         print(
-            f"Erster Lauf. {len(diff_result.candidates)} Dokument(e) als Baseline "
+            f"\nErster Lauf. {len(diff_result.candidates)} Dokument(e) als Baseline "
             f"gespeichert, noch kein Vergleich moeglich."
         )
         return
 
-    print(f"Unveraendert: {diff_result.unchanged_count} Dokument(e)")
-    print(f"Drift-Kandidaten: {len(diff_result.candidates)} Dokument(e)")
-    for candidate in diff_result.candidates:
-        print(f"\n  - {candidate.filename}")
-        print(f"    Grund: {candidate.reason}")
+    print(f"  -> {len(diff_result.candidates)} Kandidat(en) aus Schicht 1 (mtime veraendert/neu).")
 
-    if diff_result.removed_documents:
-        print(f"\nEntfernte Dokumente seit letztem Snapshot: {diff_result.removed_documents}")
+    if not diff_result.candidates:
+        print("\nKeine Aenderungen seit letztem Snapshot erkannt. Fertig.")
+        return
 
-    if not diff_result.candidates and not diff_result.removed_documents:
-        print("\nKeine Aenderungen seit letztem Snapshot erkannt.")
+    print("Schritt 4/6: Schicht 2 -- Embedding-Aehnlichkeits-Filter...")
+    embedding_results = filter_candidates(diff_result.candidates)
+    passed_candidates = [r.candidate for r in embedding_results if r.passed]
+
+    for r in embedding_results:
+        status = "WEITERGEREICHT" if r.passed else "VERWORFEN"
+        print(f"  - {r.candidate.filename}: {status} ({r.reason})")
+
+    if not passed_candidates:
+        print("\nAlle Kandidaten wurden von Schicht 2 verworfen (reine Formulierungsvarianz). Fertig.")
+        return
+
+    print(f"\nSchritt 5/6: Schicht 3 -- LLM-Judge fuer {len(passed_candidates)} Kandidat(en)...")
+    approved_proposals = []
+
+    for candidate in passed_candidates:
+        print(f"\n  Pruefe: {candidate.filename} ...")
+        recent_worklogs = _recent_worklog_summaries(current_summary, candidate.filename)
+
+        try:
+            judgment = run_drift_judge(
+                filename=candidate.filename,
+                document_summary=candidate.current_summary,
+                current_project_concept=current_summary.concept_text,
+                recent_worklog_summaries=recent_worklogs,
+            )
+        except EvaluatorError as exc:
+            print(f"    FEHLER beim Judge-Aufruf: {exc}")
+            continue
+
+        print(f"    has_drift={judgment.has_drift}, severity={judgment.severity}")
+        print(f"    Begruendung: {judgment.reasoning}")
+
+        print("Schritt 6/6: Vier-Kriterien-Scoring...")
+        scored = score_drift_judgment_heuristically(judgment)
+        print(f"    Gewichteter Score: {scored.weighted_score:.2f} -- approved={scored.approved}")
+
+        if scored.approved and judgment.has_drift:
+            approved_proposals.append((judgment, scored))
+        elif not scored.approved:
+            print(f"    Verworfen vom Evaluator: {scored.rejection_reason}")
+
+    print()
+    print("=" * 70)
+    print("ERGEBNIS -- vom Evaluator freigegebene Drift-Vorschlaege")
+    print("=" * 70)
+
+    if not approved_proposals:
+        print("Keine freigegebenen Vorschlaege. Entweder kein echter Drift erkannt,")
+        print("oder alle Kandidaten wurden vom Evaluator als nicht ausreichend bewertet.")
+        return
+
+    for judgment, scored in approved_proposals:
+        print(f"\n--- {judgment.filename} (Score {scored.weighted_score:.2f}, Severity {judgment.severity}) ---")
+        print(f"Widerspruch: {judgment.contradiction_summary}")
+        print(f"Vorschlag: {judgment.suggested_update}")
 
 
 if __name__ == "__main__":
