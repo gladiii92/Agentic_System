@@ -34,9 +34,30 @@ sonst bricht der Curator-Agent lautlos bzw. mit unklarer Fehlermeldung.
    source_file_mtimes (Dict Pfad -> mtime-float).
    (Quelle: concept_summary.py / config.py, Stand 2026-08-22)
 
-Wenn du in einem Jahr etwas an AI_Project_Reviewer aenderst und der Curator
-ploetzlich nicht mehr geht: zuerst hier oben die drei Punkte pruefen, bevor
-du im Curator-Code selbst suchst. Das ist der wahrscheinlichste Bruchpunkt.
+   WICHTIG, real herausgefunden am 2026-08-23 (siehe Chat-Verlauf,
+   Debug-Sitzung "generated_at bleibt identisch"): der Export-Pfad
+   data/exports/... ist in AI_Project_Reviewer OFFENSICHTLICH RELATIV
+   zum aktuellen Arbeitsverzeichnis (cwd) des Prozesses aufgebaut, NICHT
+   absolut zum eigenen Repo-Pfad. Ein Subprocess-Aufruf OHNE explizites
+   cwd=... landet die erzeugte Datei fälschlich im cwd des AUFRUFENDEN
+   Prozesses (bei uns: Agentic_System), nicht im AI_Project_Reviewer-Repo
+   selbst -- der Aufruf liefert trotzdem Exit-Code 0 und sieht komplett
+   erfolgreich aus (Fehler bleibt STILL, siehe Vertragspunkt 2 oben: wir
+   pruefen nur den Exit-Code, nicht den tatsaechlichen Schreibort).
+   FIX: subprocess.run() bekommt deshalb explizit cwd=ai_project_reviewer_repo_path.
+   Wenn sich dieses cwd-Verhalten in AI_Project_Reviewer jemals aendert
+   (z.B. auf absolute Pfade umgestellt wird), bleibt unser expliziter
+   cwd-Parameter trotzdem harmlos/korrekt -- kein Grund, ihn dann zu
+   entfernen.
+
+4. venv-Pfad-Annahme WAR FALSCH und wurde entfernt: die urspruengliche
+   Annahme "venv/Scripts/ai-review.exe liegt im AI_Project_Reviewer-Repo"
+   traf bei einem echten Test (2026-08-23) nicht zu (Pfad existierte
+   nicht). Es wird jetzt bewusst NUR der blanke Befehl "ai-review" ueber
+   den System-PATH verwendet -- funktioniert, WEIL/SOLANGE die
+   AI_Project_Reviewer-venv beim Aufruf aktiviert bzw. im PATH sichtbar
+   ist. Falls das kuenftig nicht mehr zutrifft: Fehlermeldung wird ueber
+   FileNotFoundError sichtbar (siehe unten), keine stille Fehlfunktion.
 ================================================================================
 
 Voraussetzung zur Laufzeit: Ollama muss erreichbar sein (laut Nutzer-Setup
@@ -91,15 +112,13 @@ class ConceptSummary:
 
 
 def _project_slug(project_name: str) -> str:
-    """Muss exakt dieselbe Slug-Logik wie AI_Project_Reviewer verwenden,
-    sonst wird der Export-Ordner nicht gefunden. Quelle: cli.py,
-    z.B. in findings_sync/review (project_name.strip().lower().replace(" ", "-")).
-    Fuer build-concept-summary selbst wird der Projektname NICHT geslugt,
-    sondern direkt scan_result.project_name als Ordnername unter
-    data/exports/ verwendet (siehe exports_dir_for_project in config.py) --
-    hier bewusst OHNE .lower()/.replace(), falls sich das als falsch
-    herausstellt, siehe TODO-Test in tests/test_concept_loader.py."""
-    return project_name.strip()
+    """Realer Test (2026-08-23) zeigt: AI_Project_Reviewer legt den Export-
+    Ordner klein geschrieben mit Unterstrichen an (z.B. "ai_project_reviewer"
+    fuer Projekt "AI_Project_Reviewer"), NICHT den Namen unveraendert. Windows
+    ist zwar meist case-insensitiv im Dateisystem, aber wir bilden die
+    tatsaechlich beobachtete Regel hier bewusst explizit nach, statt uns auf
+    Windows-Case-Insensitivität zu verlassen (waere auf Linux/Mac falsch)."""
+    return project_name.strip().lower()
 
 
 def run_concept_summary_refresh(
@@ -110,8 +129,10 @@ def run_concept_summary_refresh(
     """Stoesst per Subprocess einen frischen build-concept-summary-Lauf an.
 
     Args:
-        ai_project_reviewer_repo_path: Pfad zum AI_Project_Reviewer-Repo,
-            dessen aktivierte venv den "ai-review"-Befehl bereitstellt.
+        ai_project_reviewer_repo_path: Pfad zum AI_Project_Reviewer-Repo.
+            Wird als cwd fuer den Subprocess verwendet (siehe Vertrag Punkt 3,
+            cwd-Bugfix 2026-08-23) UND zur Herleitung des Export-Pfads in
+            load_concept_summary().
         target_project_path: Pfad des Projekts, das zusammengefasst werden
             soll (z.B. wieder AI_Project_Reviewer selbst als Testfall, siehe
             Chat-Verlauf, oder spaeter ein anderes Projekt).
@@ -120,11 +141,8 @@ def run_concept_summary_refresh(
     Raises:
         ConceptSummaryLoadError: bei Exit-Code != 0 oder Timeout.
     """
-    venv_ai_review = ai_project_reviewer_repo_path / "venv" / "Scripts" / "ai-review.exe"
-    executable = str(venv_ai_review) if venv_ai_review.exists() else CLI_COMMAND
-
     command = [
-        executable,
+        CLI_COMMAND,
         CLI_SUBCOMMAND,
         str(target_project_path),
         "--yes",
@@ -137,6 +155,7 @@ def run_concept_summary_refresh(
             text=True,
             timeout=timeout_seconds,
             check=False,
+            cwd=str(ai_project_reviewer_repo_path),
         )
     except subprocess.TimeoutExpired as exc:
         raise ConceptSummaryLoadError(
@@ -145,9 +164,9 @@ def run_concept_summary_refresh(
         ) from exc
     except FileNotFoundError as exc:
         raise ConceptSummaryLoadError(
-            f"CLI-Befehl '{executable}' nicht gefunden. Ist die venv von "
-            f"AI_Project_Reviewer aktiviert/vorhanden? Siehe Vertrag-Kommentar "
-            f"oben in diesem Modul."
+            f"CLI-Befehl '{CLI_COMMAND}' nicht gefunden. Ist die venv von "
+            f"AI_Project_Reviewer aktiviert/im PATH? Siehe Vertrag-Kommentar "
+            f"oben in diesem Modul (Punkt 4)."
         ) from exc
 
     if result.returncode != 0:
