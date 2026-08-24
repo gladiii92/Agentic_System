@@ -40,7 +40,7 @@ from agents.curator_agent.concept_loader import (
     refresh_and_load,
 )
 from agents.curator_agent.drift_diff import diff_concept_summaries
-from agents.curator_agent.embedding_filter import filter_candidates
+from agents.curator_agent.embedding_filter_chunked import filter_candidates
 from agents.curator_agent.snapshot_store import (
     load_latest_snapshot_with_raw_texts,
     save_snapshot,
