@@ -2,8 +2,22 @@
 agents/curator_agent/run_drift_check.py
 
 Orchestrator fuer Phase 1 (Curator-Agent + Evaluator-Agent, komplette
-Kaskade). Version 2026-08-24: Schicht 2 nutzt jetzt echte Rohtext-Historie
-statt Zusammenfassungs-Vergleich (siehe embedding_filter.py-Docstring).
+Kaskade). Version 2026-08-24, Fix 2: Snapshot wird jetzt erst NACH
+vollstaendig fehlerfreiem Durchlauf gespeichert, nicht mehr direkt nach
+Schritt 3 (siehe Chat-Verlauf: ein Absturz in Schicht 2 fuehrte dazu, dass
+der neue Snapshot trotzdem schon gespeichert wurde -- der naechste Lauf
+erkannte die eigentlich noch unbearbeiteten Kandidaten faelschlich als
+"bereits bekannt", weil der fehlerhafte Lauf sie unbemerkt zur neuen
+Baseline gemacht hatte).
+
+NEUES PRINZIP (wichtig fuer kuenftige Aenderungen an diesem Orchestrator):
+save_snapshot() darf NUR aufgerufen werden, wenn der komplette Durchlauf
+(Schicht 1 bis 3 + Scoring) ohne Python-Exception fertig war. Ein
+fachlicher "keine Freigabe"-Fall (Evaluator lehnt ab) ist KEIN Fehler in
+diesem Sinne -- der Snapshot wird trotzdem gespeichert, weil der
+Bewertungsprozess selbst korrekt durchlief. Nur ein technischer Fehler
+(Ollama nicht erreichbar, fehlendes Modul, Netzwerkfehler etc.) soll das
+Speichern verhindern.
 
 Ablauf:
     1. Frischer concept_summary-Lauf (concept_loader.py)
@@ -12,7 +26,7 @@ Ablauf:
     4. Schicht 2 -- Rohtext-Embedding-Aehnlichkeits-Filter (embedding_filter.py)
     5. Schicht 3 -- LLM-Judge pro durchgelassenem Kandidaten (evaluator.py)
     6. Vier-Kriterien-Scoring, NUR approved-Vorschlaege werden angezeigt
-    7. Aktuellen Stand (inkl. Rohtexte) als neuen Snapshot sichern
+    7. ERST JETZT: aktuellen Stand (inkl. Rohtexte) als neuen Snapshot sichern
 
 WICHTIG: Dieses Skript SCHREIBT NICHTS ins FIS-Vault.
 """
@@ -43,9 +57,6 @@ TARGET_PROJECT_NAME = "AI_Project_Reviewer"
 
 
 def _read_current_raw_texts(source_file_mtimes: dict[str, float]) -> dict[str, str]:
-    """Analog zu snapshot_store._read_raw_texts, aber hier separat
-    gehalten, weil der Orchestrator die Rohtexte VOR dem Speichern schon
-    fuer Schicht 2 braucht (Reihenfolge: erst vergleichen, dann speichern)."""
     raw_texts: dict[str, str] = {}
     for full_path in source_file_mtimes:
         filename = Path(full_path).name
@@ -77,7 +88,7 @@ def run() -> None:
             project_name=TARGET_PROJECT_NAME,
         )
     except ConceptSummaryLoadError as exc:
-        print(f"ABBRUCH: {exc}")
+        print(f"ABBRUCH (Snapshot NICHT gespeichert): {exc}")
         return
 
     print(f"  -> {len(current_summary.document_summaries)} Dokument(e) zusammengefasst.")
@@ -94,29 +105,36 @@ def run() -> None:
 
     print("Schritt 3/6: Schicht 1 -- deterministischer mtime-Diff...")
     diff_result = diff_concept_summaries(previous=previous_summary, current=current_summary)
+    print(f"  -> {len(diff_result.candidates)} Kandidat(en) aus Schicht 1 (mtime veraendert/neu).")
 
-    saved_path = save_snapshot(CURATOR_DATA_ROOT, TARGET_PROJECT_NAME, current_summary)
-    print(f"  -> Snapshot gespeichert unter: {saved_path}")
+    # WICHTIG: save_snapshot() wird JETZT NOCH NICHT aufgerufen (siehe
+    # Modul-Docstring oben) -- erst am Ende von run(), wenn alle Schichten
+    # ohne technischen Fehler durchgelaufen sind.
 
     if diff_result.is_first_run:
+        save_snapshot(CURATOR_DATA_ROOT, TARGET_PROJECT_NAME, current_summary)
         print(
             f"\nErster Lauf. {len(diff_result.candidates)} Dokument(e) als Baseline "
             f"gespeichert, noch kein Vergleich moeglich."
         )
         return
 
-    print(f"  -> {len(diff_result.candidates)} Kandidat(en) aus Schicht 1 (mtime veraendert/neu).")
-
     if not diff_result.candidates:
-        print("\nKeine Aenderungen seit letztem Snapshot erkannt. Fertig.")
+        save_snapshot(CURATOR_DATA_ROOT, TARGET_PROJECT_NAME, current_summary)
+        print("\nKeine Aenderungen seit letztem Snapshot erkannt. Snapshot aktualisiert. Fertig.")
         return
 
     print("Schritt 4/6: Schicht 2 -- Rohtext-Embedding-Aehnlichkeits-Filter...")
-    embedding_results = filter_candidates(
-        diff_result.candidates,
-        previous_raw_texts=previous_raw_texts,
-        current_raw_texts=current_raw_texts,
-    )
+    try:
+        embedding_results = filter_candidates(
+            diff_result.candidates,
+            previous_raw_texts=previous_raw_texts,
+            current_raw_texts=current_raw_texts,
+        )
+    except Exception as exc:  # bewusst breit: JEDER technische Fehler hier soll das Speichern verhindern
+        print(f"ABBRUCH in Schicht 2 (Snapshot NICHT gespeichert, alte Baseline bleibt erhalten): {exc}")
+        return
+
     passed_candidates = [r.candidate for r in embedding_results if r.passed]
 
     for r in embedding_results:
@@ -124,11 +142,13 @@ def run() -> None:
         print(f"  - {r.candidate.filename}: {status} ({r.reason})")
 
     if not passed_candidates:
-        print("\nAlle Kandidaten wurden von Schicht 2 verworfen (reine Formulierungsvarianz). Fertig.")
+        save_snapshot(CURATOR_DATA_ROOT, TARGET_PROJECT_NAME, current_summary)
+        print("\nAlle Kandidaten von Schicht 2 verworfen (Formulierungsvarianz). Snapshot aktualisiert. Fertig.")
         return
 
     print(f"\nSchritt 5/6: Schicht 3 -- LLM-Judge fuer {len(passed_candidates)} Kandidat(en)...")
     approved_proposals = []
+    any_judge_error = False
 
     for candidate in passed_candidates:
         print(f"\n  Pruefe: {candidate.filename} ...")
@@ -143,6 +163,7 @@ def run() -> None:
             )
         except EvaluatorError as exc:
             print(f"    FEHLER beim Judge-Aufruf: {exc}")
+            any_judge_error = True
             continue
 
         print(f"    has_drift={judgment.has_drift}, severity={judgment.severity}")
@@ -156,6 +177,17 @@ def run() -> None:
             approved_proposals.append((judgment, scored))
         elif not scored.approved:
             print(f"    Verworfen vom Evaluator: {scored.rejection_reason}")
+
+    if any_judge_error:
+        print(
+            "\nWARNUNG: Mindestens ein Judge-Aufruf ist fehlgeschlagen. Snapshot wird TROTZDEM "
+            "gespeichert, weil die uebrigen Kandidaten erfolgreich bewertet wurden -- betroffene "
+            "Datei(en) muessen beim naechsten manuellen Lauf erneut geprueft werden, falls sich "
+            "die mtime seither nicht mehr aendert (siehe TODO: Retry-Mechanismus fuer einzelne "
+            "fehlgeschlagene Kandidaten, kein Blocker fuer Phase 1)."
+        )
+
+    save_snapshot(CURATOR_DATA_ROOT, TARGET_PROJECT_NAME, current_summary)
 
     print()
     print("=" * 70)
