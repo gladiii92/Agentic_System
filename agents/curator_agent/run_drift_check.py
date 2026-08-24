@@ -1,21 +1,11 @@
 """
 agents/curator_agent/run_drift_check.py
 
-Orchestrator, FINALE Version fuer Phase-1-MVP (2026-08-24, Fix 4 --
-Abschnitts-basiertes Schreiben statt Ganze-Datei-Umschreibung). Aenderung
-gegenueber der vorherigen Version, siehe Chat-Verlauf:
-
-    6a. Abschnitt lokalisieren (section_locator.py) -- WELCHER Teil der
-        Datei ist tatsaechlich betroffen?
-    6b. NUR diesen Abschnitt an Ollama schicken (proposal_writer.py v2)
-    6c. Deterministische Validierung DES ERGEBNISSES (proposal_validation.py)
-        -- bei Fehlschlag: automatisch verwerfen, NICHT anzeigen
-    6d. Volltext programmatisch neu zusammensetzen (section_locator.replace_section)
-        -- der Rest der Datei bleibt garantiert byte-identisch
-    6e. Diff anzeigen, Human-in-the-Loop-Bestaetigung, Schreiben/Ablehnen
-
-Diese Kette macht eine Beschaedigung unbeteiligter Abschnitte STRUKTURELL
-unmoeglich -- unabhaengig davon, was Ollama im Einzelfall tut.
+Orchestrator, Version 2026-08-24 (Fix 5 -- changed_lines-Anzeige).
+Ergaenzung gegenueber der vorherigen Version: die vom Writer-Prompt
+(Version 3) zurueckgegebenen changed_lines-Begruendungen werden jetzt
+VOR dem Diff angezeigt, damit der Nutzer nachvollziehen kann, WARUM jede
+einzelne Aenderung vorgenommen wurde, bevor er den reinen Text-Diff liest.
 """
 
 from __future__ import annotations
@@ -91,6 +81,7 @@ def _handle_human_in_the_loop(
     original_full_text: str,
     updated_full_text: str,
     change_summary: str,
+    changed_lines: list[str],
     contradiction_summary: str,
     suggested_update: str,
     full_path: Path,
@@ -99,6 +90,12 @@ def _handle_human_in_the_loop(
     print(f"VORSCHAU FUER: {filename}")
     print("=" * 70)
     print(f"Aenderungs-Zusammenfassung: {change_summary}\n")
+
+    if changed_lines:
+        print("Einzeln begruendete Aenderungen:")
+        for line in changed_lines:
+            print(f"  - {line}")
+        print()
 
     if not has_actual_changes(original_full_text, updated_full_text):
         print("Kein tatsaechlicher Unterschied im vorgeschlagenen Text -- wird uebersprungen.")
@@ -268,7 +265,7 @@ def run() -> None:
             print(f"  AUTOMATISCH VERWORFEN (deterministische Validierung fehlgeschlagen):")
             for failure in validation.failures:
                 print(f"    - {failure}")
-            print("  Vorschlag wird NICHT angezeigt. Bitte spaeter erneut versuchen oder Prompt anpassen.")
+            print("  Vorschlag wird NICHT angezeigt.")
             continue
 
         updated_full_text = replace_section(original_full_text, target_section, written.updated_section_text)
@@ -278,6 +275,7 @@ def run() -> None:
             original_full_text=original_full_text,
             updated_full_text=updated_full_text,
             change_summary=written.change_summary,
+            changed_lines=written.changed_lines,
             contradiction_summary=judgment.contradiction_summary,
             suggested_update=judgment.suggested_update,
             full_path=full_path,

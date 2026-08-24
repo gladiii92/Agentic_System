@@ -1,29 +1,27 @@
 """
 agents/evaluator_agent/proposal_writer_prompt.py
 
-Vierter Prompt-Baustein. VERSION 2 (2026-08-24, nach realem Testfehler --
-siehe Chat-Verlauf): erzeugt jetzt NUR den korrigierten Text fuer EINEN
-Markdown-Abschnitt, nicht mehr die ganze Datei. Der betroffene Abschnitt
-wird von section_locator.py bestimmt; der Rest der Datei wird
-PROGRAMMATISCH unveraendert wieder zusammengefuegt (siehe run_drift_check.py).
+VERSION 3 (2026-08-24, Praezisions-Fix nach zweitem realen Testfehler --
+siehe Chat-Verlauf): Version 2 loeste das Beschaedigungs-Problem (siehe
+Version-2-Docstring), aber ein zweiter Testlauf zeigte einen SUBTILEREN
+Fehler: das Modell verallgemeinerte einen konkreten Einzelbefund ("Phase 3
+sollte abgeschlossen sein") auf ALLE offenen Phasen im Abschnitt ("Phase
+3 BIS 8 abgeschlossen"), ohne fuer jede einzelne einen Beleg im
+Projektstand zu haben -- UND entfernte dabei ungefragt Absatz-Umbrueche
+in unbeteiligten Merkposten-Texten.
 
-WARUM DIESE AENDERUNG: der urspruengliche "ganze Datei neu ausgeben"-Ansatz
-fuehrte in einem echten Testlauf zu drei Fehlern gleichzeitig: (1)
-mehrere unbeteiligte Abschnitte wurden durch identischen Platzhaltertext
-ersetzt, (2) bereits abgeschlossene Phasen wurden faelschlich auf "Offen"
-zurueckgesetzt, (3) der eigene Eingabeprompt wurde ins Ergebnis geleakt.
-Kleinerer Aufgabenumfang (ein Abschnitt statt der ganzen Datei) reduziert
-das Risiko aller drei Fehlerarten strukturell.
-
-Few-Shot-Lernen aus Ablehnungen (siehe rejection_history.py) bleibt
-unveraendert bestehen.
+FIX: Der Prompt verlangt jetzt explizit eine BEGRUENDUNG PRO EINZELNER
+ZEILE/AUSSAGE, die geaendert wird (nicht nur eine pauschale change_summary),
+und verbietet explizit "Alles-oder-Nichts"-Aenderungen an Tabellenzeilen,
+die nicht individuell belegt sind. Zusaetzlich: explizites Verbot,
+Zeilenumbrueche/Absatzstruktur in unbeteiligten Teilen zu veraendern.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-ROLE = """Du bist ein erfahrener Technical Writer. Du aktualisierst EINEN einzelnen Abschnitt eines Markdown-Dokuments aus einer internen Projekt-Wissensdatenbank, basierend auf einer bereits getroffenen fachlichen Einschätzung."""
+ROLE = """Du bist ein erfahrener, sehr präziser Technical Writer. Du aktualisierst EINEN einzelnen Abschnitt eines Markdown-Dokuments MINIMAL-INVASIV, basierend auf einer bereits getroffenen fachlichen Einschätzung. Du änderst NUR das, was konkret belegt ist -- niemals mehr."""
 
 TASK_TEMPLATE = """Ein Reviewer hat folgende Diskrepanz festgestellt, die genau diesen EINEN Abschnitt betrifft:
 
@@ -40,21 +38,23 @@ Aktueller Text NUR dieses einen Abschnitts (inklusive Überschrift):
 Tatsächlicher, aktueller Gesamtprojektstand (zur Orientierung, NICHT Teil des zu erzeugenden Texts):
 {current_project_concept}
 
-Erzeuge den korrigierten Text NUR für diesen einen Abschnitt (inklusive der Überschrift-Zeile am Anfang)."""
+Gehe JEDE Zeile/Tabellenzeile im Abschnitt einzeln durch. Ändere eine Zeile NUR, wenn der "tatsächliche Gesamtprojektstand" oben EXPLIZIT und KONKRET belegt, dass genau diese Zeile falsch ist. Wenn du für eine Zeile keinen konkreten Beleg hast, lasse sie UNVERÄNDERT -- auch wenn benachbarte Zeilen geändert werden."""
 
 CONSTRAINTS_TEMPLATE = """Wichtige Einschränkungen:
 - Gib AUSSCHLIESSLICH den Text für DIESEN EINEN Abschnitt zurück, beginnend mit der Überschrift-Zeile.
 - Gib NICHT die ganze Datei, NICHT andere Abschnitte, NICHT den obigen Projektstand-Text zurück.
 - Erfinde KEINE Fakten, die nicht im "tatsächlichen Projektstand" oben belegt sind.
-- Behalte Formatierung und Stil des Originals bei (Tabellen, Aufzählungen, Markdown-Syntax).
-- Ändere nur, was durch den Widerspruch begründet ist.
-- Falls eine Phase laut Original bereits "Abgeschlossen" war, darf der Status NIE rückwärts auf "Offen" gesetzt werden -- nur der ECHTE, im Projektstand belegte Status darf eingetragen werden.
+- KEIN "Alles-oder-Nichts": wenn eine Tabelle mehrere Zeilen hat und nur EINE Zeile konkret belegt falsch ist, ändere NUR diese eine Zeile. Die anderen Zeilen bleiben exakt wie im Original, auch wenn sie thematisch ähnlich aussehen.
+- Verändere NIEMALS Zeilenumbrüche, Absatzgrenzen oder Formatierung in Textteilen, die NICHT direkt vom Widerspruch betroffen sind. Wenn ein Absatz im Original über mehrere Zeilen umgebrochen ist, bleibt er das auch im Ergebnis, außer der Wortinhalt dieses konkreten Absatzes wird geändert.
+- Falls eine Phase laut Original bereits "Abgeschlossen" war, darf der Status NIE rückwärts auf "Offen" gesetzt werden.
+- Wenn du unsicher bist, ob eine Änderung an einer bestimmten Zeile belegt ist: lasse die Zeile UNVERÄNDERT. Im Zweifel keine Änderung statt einer unbelegten Änderung.
 {rejection_examples_block}"""
 
 OUTPUT_FORMAT = """Antworte ausschließlich mit einem JSON-Objekt exakt in dieser Struktur:
 
 {
   "updated_section_text": "der korrigierte Text NUR dieses Abschnitts, mit \\n für Zeilenumbrüche",
+  "changed_lines": ["Liste der konkret geänderten Zeilen/Aussagen, je mit kurzer Begründung, warum genau diese Zeile durch den Projektstand belegt ist"],
   "change_summary": "1-2 Sätze, was konkret geändert wurde"
 }"""
 

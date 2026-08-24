@@ -1,10 +1,11 @@
 """
 agents/evaluator_agent/proposal_writer.py
 
-VERSION 2 (2026-08-24): erzeugt jetzt nur noch den Text fuer EINEN
-Abschnitt (siehe proposal_writer_prompt.py-Docstring fuer die Begruendung
-der Aenderung). Feldname im JSON-Output entsprechend angepasst:
-updated_section_text statt updated_full_text.
+VERSION 3 (2026-08-24): ergaenzt um changed_lines -- eine Liste konkreter
+Zeilen-Begruendungen (siehe proposal_writer_prompt.py Version 3), die dem
+Nutzer in der Human-in-the-Loop-Vorschau zusaetzlich zum Diff angezeigt
+werden, damit er nachvollziehen kann, WARUM jede einzelne Aenderung
+vorgenommen wurde -- nicht nur DASS sich etwas geaendert hat.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import requests
 from agents.evaluator_agent.proposal_writer_prompt import build_proposal_writer_prompt
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_MODEL = "qwen2.5-coder:latest"
+DEFAULT_MODEL = "qwen2.5:latest"
 
 
 class ProposalWriterError(Exception):
@@ -29,6 +30,7 @@ class WrittenSectionProposal:
     filename: str
     section_heading: str
     updated_section_text: str
+    changed_lines: list[str]
     change_summary: str
 
 
@@ -87,6 +89,7 @@ def write_section_proposal(
             filename=filename,
             section_heading=section_heading,
             updated_section_text=parsed["updated_section_text"],
+            changed_lines=parsed.get("changed_lines", []),
             change_summary=parsed["change_summary"],
         )
     except KeyError as exc:
