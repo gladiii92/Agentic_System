@@ -1,35 +1,35 @@
 """
 agents/evaluator_agent/proposal_validation.py
 
-Deterministische Sicherheits-Checks (KEIN LLM) fuer einen von Ollama
-erzeugten updated_section_text, BEVOR er dem Nutzer angezeigt wird. Siehe
-Chat-Verlauf 2026-08-24: nach einem realen Fehlerfall (Prompt-Leck,
-massiver Textverlust) wurde entschieden, eine deterministische Vorprueung
-einzuziehen -- exakt das "cheap deterministic tests first"-Prinzip aus der
-Kaskaden-Architektur (embedding_filter.py), jetzt auf der Schreibseite
-angewendet statt nur auf der Erkennungsseite.
+VERSION 2 (2026-08-24, zeilengenauer Umbau): Checks bleiben inhaltlich
+gleich (Laengenverhaeltnis, Prompt-Leak-Marker), werden aber jetzt auf
+den kleinen Zeilen-Kontext-Ausschnitt angewendet statt auf einen ganzen
+Abschnitt -- die Grenzen (MAX/MIN_LENGTH_RATIO) bleiben unveraendert
+sinnvoll, da sie relative Verhaeltnisse sind, keine absoluten Groessen.
 
-Jeder Check hier ist bewusst simpel und erklaerbar -- kein ML, nur klare
-Regeln, die ein Nutzer beim Lesen sofort nachvollziehen kann.
+ZUSAETZLICHER NEUER CHECK (line_count_check): bei einem so kleinen,
+praezise umrissenen Ausschnitt ist ein sehr starker Hinweis auf ein
+Problem, wenn sich die ANZAHL der Zeilen im Ausschnitt aendert -- unser
+Prompt verlangt explizit "gib ALLE Zeilen des Kontexts zurueck", eine
+abweichende Zeilenzahl deutet auf eine ignorierte Anweisung hin.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-MAX_LENGTH_RATIO = 1.5  # neuer Text darf max. 50% laenger sein als das Original
-MIN_LENGTH_RATIO = 0.5  # neuer Text darf max. 50% kuerzer sein als das Original
+MAX_LENGTH_RATIO = 1.5
+MIN_LENGTH_RATIO = 0.5
+MAX_LINE_COUNT_DELTA = 2  # Ausschnitt darf max. 2 Zeilen mehr/weniger haben als das Original
 
-# Phrasen, die typischerweise NUR im Prompt selbst vorkommen -- wenn sie im
-# Ergebnis auftauchen, ist das ein starkes Signal fuer ein Prompt-Leck
-# (siehe realer Fehlerfall: "Antworte ausschließlich mit einem JSON-Objekt"
-# tauchte im Ergebnistext auf).
 PROMPT_LEAK_MARKERS = [
     "antworte ausschließlich",
     "wichtige einschränkungen",
     "erzeuge den korrigierten text",
     "json-objekt exakt in dieser struktur",
     "tatsächlicher, aktueller gesamtprojektstand",
+    "beginn ausschnitt",
+    "ende ausschnitt",
 ]
 
 
@@ -39,32 +39,40 @@ class ValidationResult:
     failures: list[str]
 
 
-def validate_updated_section(original_section_text: str, updated_section_text: str) -> ValidationResult:
-    """Fuehrt alle deterministischen Checks aus. passed=False bedeutet:
-    der Vorschlag wird NICHT dem Nutzer angezeigt, sondern automatisch
-    verworfen (siehe run_drift_check.py) -- unabhaengig vom LLM-Judge-
-    Score, weil dieser Score sich auf die ERKENNUNG bezog, nicht auf die
-    tatsaechliche Qualitaet DIESES konkreten Schreibvorschlags."""
+def validate_updated_context(original_context_text: str, updated_context_text: str) -> ValidationResult:
+    """original_context_text ist hier context_text_plain aus LineContext
+    (OHNE Zeilennummern-Praefixe) -- muss also mit dem verglichen werden,
+    was der Writer zurueckgibt (ebenfalls ohne Praefixe laut Prompt-Vorgabe)."""
     failures: list[str] = []
 
-    length_ratio = len(updated_section_text) / max(len(original_section_text), 1)
+    length_ratio = len(updated_context_text) / max(len(original_context_text), 1)
     if length_ratio > MAX_LENGTH_RATIO:
         failures.append(
-            f"Vorschlag ist {length_ratio:.1f}x so lang wie das Original "
+            f"Ausschnitt ist {length_ratio:.1f}x so lang wie das Original "
             f"(Grenze: {MAX_LENGTH_RATIO}x) -- moeglicher Prompt-Leak oder Wiederholungsfehler."
         )
     if length_ratio < MIN_LENGTH_RATIO:
         failures.append(
-            f"Vorschlag ist nur {length_ratio:.1f}x so lang wie das Original "
+            f"Ausschnitt ist nur {length_ratio:.1f}x so lang wie das Original "
             f"(Grenze: {MIN_LENGTH_RATIO}x) -- moeglicher Textverlust."
         )
 
-    lower_text = updated_section_text.lower()
+    original_line_count = len(original_context_text.splitlines())
+    updated_line_count = len(updated_context_text.splitlines())
+    line_delta = abs(updated_line_count - original_line_count)
+    if line_delta > MAX_LINE_COUNT_DELTA:
+        failures.append(
+            f"Zeilenanzahl im Ausschnitt hat sich um {line_delta} Zeilen veraendert "
+            f"(Original: {original_line_count}, Vorschlag: {updated_line_count}, "
+            f"Grenze: {MAX_LINE_COUNT_DELTA}) -- moegliche unvollstaendige Uebernahme."
+        )
+
+    lower_text = updated_context_text.lower()
     for marker in PROMPT_LEAK_MARKERS:
         if marker in lower_text:
             failures.append(f"Verdacht auf Prompt-Leak: Phrase '{marker}' im Ergebnistext gefunden.")
 
-    if not updated_section_text.strip():
+    if not updated_context_text.strip():
         failures.append("Vorschlag ist leer.")
 
     return ValidationResult(passed=not failures, failures=failures)

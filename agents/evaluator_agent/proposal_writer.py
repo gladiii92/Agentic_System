@@ -1,11 +1,9 @@
 """
 agents/evaluator_agent/proposal_writer.py
 
-VERSION 3 (2026-08-24): ergaenzt um changed_lines -- eine Liste konkreter
-Zeilen-Begruendungen (siehe proposal_writer_prompt.py Version 3), die dem
-Nutzer in der Human-in-the-Loop-Vorschau zusaetzlich zum Diff angezeigt
-werden, damit er nachvollziehen kann, WARUM jede einzelne Aenderung
-vorgenommen wurde -- nicht nur DASS sich etwas geaendert hat.
+VERSION 4 (2026-08-24, zeilengenauer Umbau): schreibt jetzt nur noch einen
+kleinen Kontext-Ausschnitt um EINE Zielzeile, siehe proposal_writer_prompt.py
+Version 4 und line_context_extractor.py.
 """
 
 from __future__ import annotations
@@ -26,29 +24,28 @@ class ProposalWriterError(Exception):
 
 
 @dataclass(frozen=True)
-class WrittenSectionProposal:
+class WrittenContextProposal:
     filename: str
-    section_heading: str
-    updated_section_text: str
-    changed_lines: list[str]
+    target_line_number: int
+    updated_context_text: str
     change_summary: str
 
 
-def write_section_proposal(
+def write_context_proposal(
     filename: str,
-    section_heading: str,
-    section_text: str,
+    target_line_number: int,
+    numbered_context_text: str,
     contradiction_summary: str,
     suggested_update: str,
     current_project_concept: str,
     rejection_examples: list[str] | None = None,
     model: str = DEFAULT_MODEL,
-    timeout_seconds: int = 120,
-) -> WrittenSectionProposal:
+    timeout_seconds: int = 90,
+) -> WrittenContextProposal:
     prompt = build_proposal_writer_prompt(
         filename=filename,
-        section_heading=section_heading,
-        section_text=section_text,
+        target_line_number=target_line_number,
+        numbered_context_text=numbered_context_text,
         contradiction_summary=contradiction_summary,
         suggested_update=suggested_update,
         current_project_concept=current_project_concept,
@@ -85,11 +82,10 @@ def write_section_proposal(
         ) from exc
 
     try:
-        return WrittenSectionProposal(
+        return WrittenContextProposal(
             filename=filename,
-            section_heading=section_heading,
-            updated_section_text=parsed["updated_section_text"],
-            changed_lines=parsed.get("changed_lines", []),
+            target_line_number=target_line_number,
+            updated_context_text=parsed["updated_context_text"],
             change_summary=parsed["change_summary"],
         )
     except KeyError as exc:

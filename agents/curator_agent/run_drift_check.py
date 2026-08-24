@@ -1,11 +1,30 @@
 """
 agents/curator_agent/run_drift_check.py
 
-Orchestrator, Version 2026-08-24 (Fix 5 -- changed_lines-Anzeige).
-Ergaenzung gegenueber der vorherigen Version: die vom Writer-Prompt
-(Version 3) zurueckgegebenen changed_lines-Begruendungen werden jetzt
-VOR dem Diff angezeigt, damit der Nutzer nachvollziehen kann, WARUM jede
-einzelne Aenderung vorgenommen wurde, bevor er den reinen Text-Diff liest.
+Orchestrator, VERSION 2026-08-24 -- grundlegender Umbau auf zeilengenaue,
+Finding-fuer-Finding-Verarbeitung (siehe Chat-Verlauf: Nutzer-Anforderung
+"exakte Stelle identifizieren, Kontext davor/danach, von Aenderung zu
+Aenderung, egal wie viele").
+
+NEUER ABLAUF (Schritt 5+6 grundlegend anders als in Vorversionen):
+    5. Judge liefert eine LISTE von DriftFinding (je mit exakter
+       line_number), nicht mehr ein einzelnes Urteil pro Dokument.
+    6. Fuer JEDES Finding einzeln:
+       a. Score berechnen, bei approved=False dieses Finding uebergehen
+       b. Kontext-Ausschnitt um die exakte Zeile extrahieren (5 Zeilen
+          davor/danach, line_context_extractor.py)
+       c. NUR diesen Ausschnitt an den Writer schicken
+       d. Deterministisch validieren
+       e. Bei Erfolg: Human-in-the-Loop pro Einzeloeanderung
+       f. Bei Bestaetigung ("ja"): NUR dieser eine Ausschnitt wird in die
+          Datei geschrieben, BEVOR das naechste Finding bearbeitet wird
+          (Datei wird zwischen Findings neu von der Platte gelesen, damit
+          Zeilennummern nachfolgender Findings, die VOR der geschriebenen
+          Aenderung im Dokument liegen, konsistent bleiben -- Findings
+          werden deshalb nach line_number ABSTEIGEND sortiert bearbeitet,
+          siehe _findings_sorted_descending, damit ein frueh geschriebener
+          Vorschlag die Zeilennummern SPAETERER, noch ausstehender
+          Findings nicht verschiebt).
 """
 
 from __future__ import annotations
@@ -19,22 +38,19 @@ from agents.curator_agent.concept_loader import (
 from agents.curator_agent.diff_presenter import build_unified_diff, has_actual_changes
 from agents.curator_agent.drift_diff import diff_concept_summaries
 from agents.curator_agent.embedding_filter_chunked import filter_candidates
-from agents.curator_agent.section_locator import (
-    find_most_relevant_section,
-    replace_section,
-    split_into_sections,
-)
+from agents.curator_agent.line_context_extractor import extract_context, replace_context_in_full_text
 from agents.curator_agent.snapshot_store import (
     load_latest_snapshot_with_raw_texts,
     save_snapshot,
 )
 from agents.evaluator_agent.evaluator import (
+    DriftFinding,
     EvaluatorError,
     run_drift_judge,
-    score_drift_judgment_heuristically,
+    score_finding_heuristically,
 )
-from agents.evaluator_agent.proposal_validation import validate_updated_section
-from agents.evaluator_agent.proposal_writer import ProposalWriterError, write_section_proposal
+from agents.evaluator_agent.proposal_validation import validate_updated_context
+from agents.evaluator_agent.proposal_writer import ProposalWriterError, write_context_proposal
 from agents.evaluator_agent.rejection_history import (
     format_for_prompt,
     load_rejections,
@@ -76,36 +92,78 @@ def _recent_worklog_summaries(current_summary, exclude_filename: str) -> str:
     return "\n".join(parts)
 
 
-def _handle_human_in_the_loop(
+def _findings_sorted_descending(findings: list[DriftFinding]) -> list[DriftFinding]:
+    """Sortiert nach line_number ABSTEIGEND (siehe Modul-Docstring): wenn
+    wir von unten nach oben durch die Datei arbeiten, veraendert das
+    Schreiben eines Vorschlags weiter unten NIE die Zeilennummern der noch
+    ausstehenden Findings weiter oben."""
+    return sorted(findings, key=lambda f: f.line_number, reverse=True)
+
+
+def _handle_single_finding(
     filename: str,
-    original_full_text: str,
-    updated_full_text: str,
-    change_summary: str,
-    changed_lines: list[str],
-    contradiction_summary: str,
-    suggested_update: str,
     full_path: Path,
+    finding: DriftFinding,
+    current_project_concept: str,
+    rejection_examples: list[str],
 ) -> None:
+    """Verarbeitet EIN einzelnes Finding komplett: Kontext extrahieren,
+    schreiben lassen, validieren, Human-in-the-Loop, ggf. Datei aktualisieren.
+    Liest die Datei am ANFANG frisch von der Platte, damit vorherige, in
+    diesem selben Lauf bereits geschriebene Aenderungen beruecksichtigt
+    sind."""
+    current_full_text = full_path.read_text(encoding="utf-8")
+    total_lines = len(current_full_text.splitlines())
+
+    if finding.line_number < 1 or finding.line_number > total_lines:
+        print(
+            f"    UEBERSPRUNGEN: Zeile {finding.line_number} liegt ausserhalb des "
+            f"aktuellen Dokuments (1-{total_lines}) -- vermutlich durch eine vorherige "
+            f"Aenderung in diesem Lauf verschoben oder Judge-Fehler."
+        )
+        return
+
+    context = extract_context(current_full_text, finding.line_number)
+
+    try:
+        written = write_context_proposal(
+            filename=filename,
+            target_line_number=finding.line_number,
+            numbered_context_text=context.context_text,
+            contradiction_summary=finding.contradiction_summary,
+            suggested_update=finding.suggested_update,
+            current_project_concept=current_project_concept,
+            rejection_examples=rejection_examples,
+        )
+    except ProposalWriterError as exc:
+        print(f"    FEHLER beim Erzeugen des Vorschlags fuer Zeile {finding.line_number}: {exc}")
+        return
+
+    validation = validate_updated_context(context.context_text_plain, written.updated_context_text)
+    if not validation.passed:
+        print(f"    AUTOMATISCH VERWORFEN fuer Zeile {finding.line_number}:")
+        for failure in validation.failures:
+            print(f"      - {failure}")
+        return
+
+    updated_full_text = replace_context_in_full_text(current_full_text, context, written.updated_context_text)
+
     print("\n" + "=" * 70)
-    print(f"VORSCHAU FUER: {filename}")
+    print(f"VORSCHAU FUER: {filename}, Zeile {finding.line_number} (Kontext {context.context_start_line}-{context.context_end_line})")
     print("=" * 70)
-    print(f"Aenderungs-Zusammenfassung: {change_summary}\n")
+    print(f"Aenderungs-Zusammenfassung: {written.change_summary}\n")
 
-    if changed_lines:
-        print("Einzeln begruendete Aenderungen:")
-        for line in changed_lines:
-            print(f"  - {line}")
-        print()
-
-    if not has_actual_changes(original_full_text, updated_full_text):
+    if not has_actual_changes(current_full_text, updated_full_text):
         print("Kein tatsaechlicher Unterschied im vorgeschlagenen Text -- wird uebersprungen.")
         return
 
-    diff_text = build_unified_diff(original_full_text, updated_full_text, filename)
+    diff_text = build_unified_diff(current_full_text, updated_full_text, filename)
     print(diff_text)
     print()
 
-    answer = input(f"Diesen Vorschlag fuer {filename} JETZT schreiben? (ja/nein): ").strip().lower()
+    answer = input(
+        f"Diese Aenderung an Zeile {finding.line_number} JETZT schreiben? (ja/nein): "
+    ).strip().lower()
 
     if answer in ("ja", "j", "yes", "y"):
         full_path.write_text(updated_full_text, encoding="utf-8")
@@ -118,9 +176,9 @@ def _handle_human_in_the_loop(
             rejection_history_root=REJECTION_HISTORY_ROOT,
             agent_name=AGENT_NAME,
             filename=filename,
-            contradiction_summary=contradiction_summary,
-            suggested_update=suggested_update,
-            proposed_text=updated_full_text,
+            contradiction_summary=finding.contradiction_summary,
+            suggested_update=finding.suggested_update,
+            proposed_text=written.updated_context_text,
             rejection_reason=reason,
         )
         print("-> Abgelehnt. In Ablehnungs-Historie gespeichert fuer kuenftige Prompts.")
@@ -189,17 +247,18 @@ def run() -> None:
         return
 
     print(f"\nSchritt 5/6: Schicht 3 -- LLM-Judge fuer {len(passed_candidates)} Kandidat(en)...")
-    approved_proposals = []
+    all_findings_by_candidate: dict[str, list[DriftFinding]] = {}
     any_judge_error = False
 
     for candidate in passed_candidates:
         print(f"\n  Pruefe: {candidate.filename} ...")
         recent_worklogs = _recent_worklog_summaries(current_summary, candidate.filename)
+        full_text = current_raw_texts.get(candidate.filename, "")
 
         try:
-            judgment = run_drift_judge(
+            findings = run_drift_judge(
                 filename=candidate.filename,
-                document_summary=candidate.current_summary,
+                full_document_text=full_text,
                 current_project_concept=current_summary.concept_text,
                 recent_worklog_summaries=recent_worklogs,
             )
@@ -208,78 +267,52 @@ def run() -> None:
             any_judge_error = True
             continue
 
-        print(f"    has_drift={judgment.has_drift}, severity={judgment.severity}")
-        print(f"    Begruendung: {judgment.reasoning}")
+        print(f"    -> {len(findings)} Finding(s) gefunden.")
+        approved_findings = []
+        for finding in findings:
+            scored = score_finding_heuristically(finding)
+            print(
+                f"    Zeile {finding.line_number} ({finding.severity}): "
+                f"Score {scored.weighted_score:.2f}, approved={scored.approved}"
+            )
+            if scored.approved:
+                approved_findings.append(finding)
+            else:
+                print(f"      Verworfen: {scored.rejection_reason}")
 
-        scored = score_drift_judgment_heuristically(judgment)
-        print(f"    Gewichteter Score: {scored.weighted_score:.2f} -- approved={scored.approved}")
-
-        if scored.approved and judgment.has_drift:
-            approved_proposals.append((candidate, judgment, scored))
-        elif not scored.approved:
-            print(f"    Verworfen vom Evaluator: {scored.rejection_reason}")
+        if approved_findings:
+            all_findings_by_candidate[candidate.filename] = approved_findings
 
     if any_judge_error:
         print("\nWARNUNG: Mindestens ein Judge-Aufruf ist fehlgeschlagen (Snapshot wird trotzdem gespeichert).")
 
     save_snapshot(CURATOR_DATA_ROOT, TARGET_PROJECT_NAME, current_summary)
 
-    if not approved_proposals:
-        print("\nKeine freigegebenen Vorschlaege.")
+    if not all_findings_by_candidate:
+        print("\nKeine freigegebenen Findings.")
         return
 
-    print("\nSchritt 6/6: Abschnitt lokalisieren, gezielt umschreiben, validieren, Human-in-the-Loop...")
+    print("\nSchritt 6/6: Fuer jedes Finding einzeln -- Kontext extrahieren, Human-in-the-Loop...")
     rejections = load_rejections(REJECTION_HISTORY_ROOT, AGENT_NAME)
     rejection_examples = format_for_prompt(rejections)
 
-    for candidate, judgment, scored in approved_proposals:
-        original_full_text = current_raw_texts.get(candidate.filename)
-        full_path = _full_path_for_filename(current_summary.source_file_mtimes, candidate.filename)
-
-        if original_full_text is None or full_path is None:
-            print(f"ABBRUCH fuer {candidate.filename}: Originaltext/Pfad nicht auffindbar.")
+    for filename, findings in all_findings_by_candidate.items():
+        full_path = _full_path_for_filename(current_summary.source_file_mtimes, filename)
+        if full_path is None:
+            print(f"ABBRUCH fuer {filename}: Pfad nicht auffindbar.")
             continue
 
-        sections = split_into_sections(original_full_text)
-        target_section = find_most_relevant_section(
-            sections, judgment.contradiction_summary, judgment.suggested_update
-        )
-        print(f"\n  Lokalisierter Abschnitt fuer {candidate.filename}: '{target_section.heading}'")
+        findings_desc = _findings_sorted_descending(findings)
+        print(f"\n{filename}: {len(findings_desc)} Finding(s) werden von unten nach oben verarbeitet.")
 
-        try:
-            written = write_section_proposal(
-                filename=candidate.filename,
-                section_heading=target_section.heading,
-                section_text=target_section.text,
-                contradiction_summary=judgment.contradiction_summary,
-                suggested_update=judgment.suggested_update,
+        for finding in findings_desc:
+            _handle_single_finding(
+                filename=filename,
+                full_path=full_path,
+                finding=finding,
                 current_project_concept=current_summary.concept_text,
                 rejection_examples=rejection_examples,
             )
-        except ProposalWriterError as exc:
-            print(f"FEHLER beim Erzeugen des Abschnitts-Vorschlags fuer {candidate.filename}: {exc}")
-            continue
-
-        validation = validate_updated_section(target_section.text, written.updated_section_text)
-        if not validation.passed:
-            print(f"  AUTOMATISCH VERWORFEN (deterministische Validierung fehlgeschlagen):")
-            for failure in validation.failures:
-                print(f"    - {failure}")
-            print("  Vorschlag wird NICHT angezeigt.")
-            continue
-
-        updated_full_text = replace_section(original_full_text, target_section, written.updated_section_text)
-
-        _handle_human_in_the_loop(
-            filename=candidate.filename,
-            original_full_text=original_full_text,
-            updated_full_text=updated_full_text,
-            change_summary=written.change_summary,
-            changed_lines=written.changed_lines,
-            contradiction_summary=judgment.contradiction_summary,
-            suggested_update=judgment.suggested_update,
-            full_path=full_path,
-        )
 
 
 if __name__ == "__main__":

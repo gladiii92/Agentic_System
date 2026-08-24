@@ -1,42 +1,35 @@
 """
 agents/evaluator_agent/drift_judge_prompt.py
 
-Schicht 3 der Evaluator-Kaskade -- der eigentliche LLM-as-Judge-Prompt fuer
-die Frage "widerspricht dieses Vault-Dokument dem aktuellen, echten
-Projektstand inhaltlich?". Baustein des Bewertungs-Agenten (Evaluator),
-der laut Grundsatzentscheidung (Handover-Dokument, Abschnitt 2.2/2.4)
-eine QUERSCHNITTS-Komponente ist -- wird hier zuerst fuer den Curator
-gebraucht, spaeter aber auch vom Builder-Agenten genutzt (andere
-Kriterien-Instanzen, gleiche Architektur, siehe evaluator.py).
+VERSION 2 (2026-08-24, grundlegender Umbau auf zeilengenaue Lokalisierung
+-- siehe Chat-Verlauf: Nutzer-Anforderung, EXAKTE betroffene Zeilen zu
+identifizieren statt grobe Abschnitte per Wortueberlappung zu raten).
 
-Prompt-Stil bewusst analog zu AI_Project_Reviewer/prompts/reviewer_prompt.py
-(vier austauschbare Komponenten: role, task, constraints, output_format),
-NICHT Jinja2 -- kein Grund fuer eine Templating-Engine bei so wenigen,
-einfachen Platzhaltern (siehe Begruendung im Original-Modul).
+AENDERUNG GEGENUEBER VERSION 1: Der Judge bekommt den Dateiinhalt jetzt
+MIT ZEILENNUMMERN versehen und liefert eine LISTE von Einzelbefunden,
+jeweils mit exakter Zeilennummer, statt eines einzelnen has_drift/
+contradiction_summary-Paars. Das macht die nachgelagerte Lokalisierung
+(line_context_extractor.py) deterministisch statt heuristisch-geraten.
 
-Best-Practice-Entscheidungen aus Recherche (siehe Chat-Verlauf 2026-08-22):
-- Judge muss ERST begruenden, DANN strikt strukturiert antworten (schlechtes
-  Ergebnis bei Freitext-Score ohne Begruendung, siehe G-Eval-Recherche).
-- Temperature=0 beim Ollama-Aufruf (Determinismus, siehe ollama_client.py
-  aus AI_Project_Reviewer -- call_ollama unterstuetzt das vermutlich schon,
-  ggf. beim naechsten Baustein pruefen).
-- Bewertung ausschliesslich auf Basis des gegebenen Kontexts, keine
-  Spekulation ueber nicht enthaltene Informationen (identische Regel wie
-  im Original-reviewer_prompt.py CONSTRAINTS-Block).
+Grund fuer diesen Umbau (siehe Chat-Verlauf): die bisherige Abschnitts-
+Lokalisierung per Wortueberlappung waehlte zweimal den falschen Bereich
+im Dokument, weil thematisch aehnliche Woerter in mehreren Abschnitten
+vorkommen. Mit exakten Zeilennummern entfaellt dieses Rate-Problem
+vollstaendig.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-ROLE = """Du bist ein erfahrener Technical Writer und Projektmanager. Du prüfst, ob ein einzelnes Dokument aus einer internen Projekt-Wissensdatenbank (Obsidian-Vault) noch inhaltlich zum tatsächlichen, aktuellen Stand eines Software-Projekts passt."""
+ROLE = """Du bist ein erfahrener Technical Writer und Projektmanager. Du prüfst zeilengenau, ob ein Vault-Dokument noch inhaltlich zum tatsächlichen, aktuellen Stand eines Software-Projekts passt."""
 
-TASK_TEMPLATE = """Vergleiche die folgende Vault-Dokument-Zusammenfassung mit dem tatsächlichen, aktuellen Gesamtprojektstand.
+TASK_TEMPLATE = """Vergleiche das folgende Vault-Dokument (mit Zeilennummern versehen) mit dem tatsächlichen, aktuellen Gesamtprojektstand.
 
 Dateiname: {filename}
 
-Zusammenfassung des Vault-Dokuments (das, was aktuell im Vault steht):
-{document_summary}
+Vollständiger Inhalt des Vault-Dokuments, JEDE Zeile mit Zeilennummer (Format "N: Inhalt"):
+{numbered_document_text}
 
 Tatsächlicher, aktueller Gesamtprojektstand (aus frischem Code-/Vault-Scan):
 {current_project_concept}
@@ -44,26 +37,32 @@ Tatsächlicher, aktueller Gesamtprojektstand (aus frischem Code-/Vault-Scan):
 Zusätzlicher Kontext -- neuere Arbeitsprotokolle (Worklogs), die zeitlich NACH diesem Dokument entstanden sind und den tatsächlichen Fortschritt zeigen:
 {recent_worklog_summaries}
 
-Prüfe:
-- Behauptet das Vault-Dokument einen Projektstatus (z.B. eine Phase, einen Fertigstellungsgrad, eine geplante vs. bereits umgesetzte Funktion), der dem tatsächlichen Stand laut den Worklogs/dem Gesamtprojektstand widerspricht?
-- Ist die Diskrepanz relevant (z.B. veraltete Phase-Angabe, längst umgesetzte Funktion wird noch als "geplant" beschrieben) oder nur unwesentlich (z.B. leicht andere Wortwahl, gleiche Kernaussage)?"""
+Finde ALLE Stellen (nicht nur die erste!) in dem Dokument, an denen eine ZEILE einen Projektstatus, eine Phase, einen Fertigstellungsgrad oder eine geplante vs. bereits umgesetzte Funktion behauptet, die dem tatsächlichen Stand laut den Worklogs/dem Gesamtprojektstand widerspricht ODER eine offene Handlungsaufforderung enthält, die jetzt laut Projektstand erledigt werden kann."""
 
 CONSTRAINTS = """Wichtige Einschränkungen:
 - Bewerte NUR auf Basis der oben gegebenen Texte. Spekuliere NICHT über Informationen, die dort nicht enthalten sind.
 - Eine andere Formulierung derselben Aussage ist KEIN Widerspruch.
-- Nur ein tatsächlicher inhaltlicher Widerspruch zum beschriebenen Projektstand zählt als Drift.
-- Wenn du unsicher bist, ob ein Widerspruch besteht, stufe severity als LOW ein statt zu raten.
+- Gib fuer JEDEN gefundenen Einzelbefund die EXAKTE Zeilennummer an, an der die widersprüchliche/veraltete Aussage steht (die Zeilennummer aus dem "N:"-Präfix, nicht geschätzt).
+- Wenn mehrere aufeinanderfolgende Zeilen zusammen EINE Aussage bilden (z.B. eine mehrzeilige Tabellenzeile), gib die Zeilennummer der ERSTEN betroffenen Zeile an.
+- Wenn du unsicher bist, ob ein Widerspruch besteht, stufe severity als LOW ein statt zu raten, oder lasse den Befund ganz weg.
+- Wenn KEIN Widerspruch gefunden wird, gib eine leere findings-Liste zurück.
 - Antworte ausschließlich mit validem JSON, kein Freitext davor oder danach."""
 
 OUTPUT_FORMAT = """Antworte ausschließlich mit einem JSON-Objekt exakt in dieser Struktur:
 
 {
-  "reasoning": "kurze Begründung deiner Einschätzung, 2-4 Sätze, BEVOR du zum Urteil kommst",
-  "has_drift": true oder false,
-  "severity": "LOW" | "MEDIUM" | "HIGH",
-  "contradiction_summary": "falls has_drift=true: was genau widerspricht sich, 1-2 Sätze. Sonst leerer String.",
-  "suggested_update": "falls has_drift=true: konkreter Vorschlag, wie das Vault-Dokument angepasst werden sollte. Sonst leerer String."
-}"""
+  "findings": [
+    {
+      "line_number": 42,
+      "reasoning": "kurze Begründung, 1-2 Sätze, BEVOR du zum Urteil kommst",
+      "severity": "LOW" | "MEDIUM" | "HIGH",
+      "contradiction_summary": "was genau widerspricht sich an dieser Zeile, 1 Satz",
+      "suggested_update": "konkreter Vorschlag, wie GENAU DIESE ZEILE angepasst werden sollte"
+    }
+  ]
+}
+
+Falls keine Widersprüche gefunden werden, gib {"findings": []} zurück."""
 
 
 @dataclass(frozen=True)
@@ -74,29 +73,32 @@ class DriftJudgePromptComponents:
     output_format: str = OUTPUT_FORMAT
 
 
+def number_lines(text: str) -> str:
+    """Versieht jede Zeile mit einer 1-basierten Zeilennummer im Format
+    'N: Inhalt'. 1-basiert, weil das fuer einen Menschen/Judge intuitiver
+    ist als 0-basiert und leichter mit einem Text-Editor abzugleichen."""
+    lines = text.splitlines()
+    return "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines))
+
+
 def build_drift_judge_prompt(
     filename: str,
-    document_summary: str,
+    numbered_document_text: str,
     current_project_concept: str,
     recent_worklog_summaries: str,
     components: DriftJudgePromptComponents | None = None,
 ) -> str:
-    """Setzt die vier Prompt-Bausteine zu einem finalen String zusammen.
-
-    Args:
-        filename: Name des zu pruefenden Vault-Dokuments (z.B. "ROADMAP.md").
-        document_summary: Aktuelle Ollama-Zusammenfassung dieses Dokuments.
-        current_project_concept: concept_text aus dem aktuellen ConceptSummary
-            (Gesamtprojektstand laut frischem Scan).
-        recent_worklog_summaries: Zusammengefuegter Text aus den summary-
-            Feldern aller Worklog-Dokumente, die neuer sind als das zu
-            pruefende Dokument (Herleitung "neuer als" folgt in
-            evaluator.py, nicht in diesem Modul).
+    """Args:
+    numbered_document_text: Ergebnis von number_lines() ueber den VOLLEN
+        Dateitext (nicht nur eine Zusammenfassung!) -- Aenderung gegenueber
+        Version 1, die nur die Ollama-Zusammenfassung erhielt. Der Judge
+        braucht jetzt den echten Text, um echte Zeilennummern liefern zu
+        koennen.
     """
     components = components or DriftJudgePromptComponents()
     task = components.task_template.format(
         filename=filename,
-        document_summary=document_summary,
+        numbered_document_text=numbered_document_text,
         current_project_concept=current_project_concept,
         recent_worklog_summaries=recent_worklog_summaries or "(keine neueren Worklogs vorhanden)",
     )

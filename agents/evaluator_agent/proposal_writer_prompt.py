@@ -1,61 +1,53 @@
 """
 agents/evaluator_agent/proposal_writer_prompt.py
 
-VERSION 3 (2026-08-24, Praezisions-Fix nach zweitem realen Testfehler --
-siehe Chat-Verlauf): Version 2 loeste das Beschaedigungs-Problem (siehe
-Version-2-Docstring), aber ein zweiter Testlauf zeigte einen SUBTILEREN
-Fehler: das Modell verallgemeinerte einen konkreten Einzelbefund ("Phase 3
-sollte abgeschlossen sein") auf ALLE offenen Phasen im Abschnitt ("Phase
-3 BIS 8 abgeschlossen"), ohne fuer jede einzelne einen Beleg im
-Projektstand zu haben -- UND entfernte dabei ungefragt Absatz-Umbrueche
-in unbeteiligten Merkposten-Texten.
-
-FIX: Der Prompt verlangt jetzt explizit eine BEGRUENDUNG PRO EINZELNER
-ZEILE/AUSSAGE, die geaendert wird (nicht nur eine pauschale change_summary),
-und verbietet explizit "Alles-oder-Nichts"-Aenderungen an Tabellenzeilen,
-die nicht individuell belegt sind. Zusaetzlich: explizites Verbot,
-Zeilenumbrueche/Absatzstruktur in unbeteiligten Teilen zu veraendern.
+VERSION 4 (2026-08-24, zeilengenauer Umbau -- siehe Chat-Verlauf). Erhaelt
+jetzt nur noch einen KLEINEN Zeilen-Kontext-Ausschnitt (Standard 5 Zeilen
+davor/danach um die vom Judge exakt gemeldete Zeile), statt eines ganzen
+Abschnitts. Das minimiert die Aufgabe fuer das Modell auf das absolute
+Minimum -- je kleiner der bearbeitete Textbereich, desto geringer das
+Risiko von Uebergeneralisierung oder Formatierungs-Beschaedigung (siehe
+die beiden vorherigen realen Fehlerfaelle im Chat-Verlauf).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-ROLE = """Du bist ein erfahrener, sehr präziser Technical Writer. Du aktualisierst EINEN einzelnen Abschnitt eines Markdown-Dokuments MINIMAL-INVASIV, basierend auf einer bereits getroffenen fachlichen Einschätzung. Du änderst NUR das, was konkret belegt ist -- niemals mehr."""
+ROLE = """Du bist ein erfahrener, sehr präziser Technical Writer. Du aktualisierst einen KLEINEN Zeilen-Ausschnitt eines Markdown-Dokuments MINIMAL-INVASIV, basierend auf einer bereits getroffenen fachlichen Einschätzung zu GENAU EINER Zeile. Du änderst NUR das, was konkret belegt ist -- niemals mehr."""
 
-TASK_TEMPLATE = """Ein Reviewer hat folgende Diskrepanz festgestellt, die genau diesen EINEN Abschnitt betrifft:
+TASK_TEMPLATE = """Ein Reviewer hat folgende Diskrepanz an EINER BESTIMMTEN ZEILE festgestellt:
 
 Dateiname: {filename}
-Abschnitts-Überschrift: {section_heading}
+Betroffene Zeile (Nummer): {target_line_number}
 Widerspruch: {contradiction_summary}
 Beschreibender Verbesserungsvorschlag des Reviewers: {suggested_update}
 
-Aktueller Text NUR dieses einen Abschnitts (inklusive Überschrift):
----BEGINN ABSCHNITT---
-{section_text}
----ENDE ABSCHNITT---
+Kontext-Ausschnitt um die betroffene Zeile (mit Zeilennummern, Format "N: Inhalt"):
+---BEGINN AUSSCHNITT---
+{numbered_context_text}
+---ENDE AUSSCHNITT---
 
 Tatsächlicher, aktueller Gesamtprojektstand (zur Orientierung, NICHT Teil des zu erzeugenden Texts):
 {current_project_concept}
 
-Gehe JEDE Zeile/Tabellenzeile im Abschnitt einzeln durch. Ändere eine Zeile NUR, wenn der "tatsächliche Gesamtprojektstand" oben EXPLIZIT und KONKRET belegt, dass genau diese Zeile falsch ist. Wenn du für eine Zeile keinen konkreten Beleg hast, lasse sie UNVERÄNDERT -- auch wenn benachbarte Zeilen geändert werden."""
+Ändere AUSSCHLIESSLICH Zeile {target_line_number} (und höchstens 1-2 direkt logisch zusammenhängende Nachbarzeilen, falls die Aussage über mehrere Zeilen geht). ALLE anderen Zeilen im Ausschnitt bleiben BUCHSTABENGETREU unverändert."""
 
-CONSTRAINTS_TEMPLATE = """Wichtige Einschränkungen:
-- Gib AUSSCHLIESSLICH den Text für DIESEN EINEN Abschnitt zurück, beginnend mit der Überschrift-Zeile.
-- Gib NICHT die ganze Datei, NICHT andere Abschnitte, NICHT den obigen Projektstand-Text zurück.
+CONSTRAINTS = """Wichtige Einschränkungen:
+- Gib den GESAMTEN Ausschnitt zurück (alle Zeilen des Kontexts), NICHT nur die geänderte Zeile -- aber alle unveränderten Zeilen müssen ZEICHENGENAU identisch zum Original bleiben.
+- Ändere NUR Zeile {target_line_number} und ggf. direkt logisch zusammenhängende Nachbarzeilen. Ändere KEINE anderen Zeilen, auch wenn sie ähnlich aussehen.
 - Erfinde KEINE Fakten, die nicht im "tatsächlichen Projektstand" oben belegt sind.
-- KEIN "Alles-oder-Nichts": wenn eine Tabelle mehrere Zeilen hat und nur EINE Zeile konkret belegt falsch ist, ändere NUR diese eine Zeile. Die anderen Zeilen bleiben exakt wie im Original, auch wenn sie thematisch ähnlich aussehen.
-- Verändere NIEMALS Zeilenumbrüche, Absatzgrenzen oder Formatierung in Textteilen, die NICHT direkt vom Widerspruch betroffen sind. Wenn ein Absatz im Original über mehrere Zeilen umgebrochen ist, bleibt er das auch im Ergebnis, außer der Wortinhalt dieses konkreten Absatzes wird geändert.
-- Falls eine Phase laut Original bereits "Abgeschlossen" war, darf der Status NIE rückwärts auf "Offen" gesetzt werden.
-- Wenn du unsicher bist, ob eine Änderung an einer bestimmten Zeile belegt ist: lasse die Zeile UNVERÄNDERT. Im Zweifel keine Änderung statt einer unbelegten Änderung.
+- Behalte Formatierung bei (Tabellen-Pipe-Zeichen, Einrückung, Markdown-Syntax).
+- Verändere KEINE Zeilenumbrüche oder Leerzeilen, außer der Wortinhalt der Zielzeile selbst ändert sich.
+- Falls die Zielzeile einen Status "Abgeschlossen" enthält, darf er NIE rückwärts auf "Offen" gesetzt werden.
+- Gib NICHT die Zeilennummern-Präfixe ("N: ") im updated_context_text zurück -- nur den reinen Zeileninhalt.
 {rejection_examples_block}"""
 
 OUTPUT_FORMAT = """Antworte ausschließlich mit einem JSON-Objekt exakt in dieser Struktur:
 
 {
-  "updated_section_text": "der korrigierte Text NUR dieses Abschnitts, mit \\n für Zeilenumbrüche",
-  "changed_lines": ["Liste der konkret geänderten Zeilen/Aussagen, je mit kurzer Begründung, warum genau diese Zeile durch den Projektstand belegt ist"],
-  "change_summary": "1-2 Sätze, was konkret geändert wurde"
+  "updated_context_text": "der korrigierte Ausschnitt, ALLE Zeilen, OHNE Zeilennummern-Präfixe, mit \\n für Zeilenumbrüche",
+  "change_summary": "1 Satz, was konkret an welcher Zeile geändert wurde"
 }"""
 
 
@@ -63,14 +55,14 @@ OUTPUT_FORMAT = """Antworte ausschließlich mit einem JSON-Objekt exakt in diese
 class ProposalWriterPromptComponents:
     role: str = ROLE
     task_template: str = TASK_TEMPLATE
-    constraints_template: str = CONSTRAINTS_TEMPLATE
+    constraints: str = CONSTRAINTS
     output_format: str = OUTPUT_FORMAT
 
 
 def build_proposal_writer_prompt(
     filename: str,
-    section_heading: str,
-    section_text: str,
+    target_line_number: int,
+    numbered_context_text: str,
     contradiction_summary: str,
     suggested_update: str,
     current_project_concept: str,
@@ -81,8 +73,8 @@ def build_proposal_writer_prompt(
 
     task = components.task_template.format(
         filename=filename,
-        section_heading=section_heading or "(kein Überschrift-Text, Anfang der Datei)",
-        section_text=section_text,
+        target_line_number=target_line_number,
+        numbered_context_text=numbered_context_text,
         contradiction_summary=contradiction_summary,
         suggested_update=suggested_update,
         current_project_concept=current_project_concept,
@@ -97,6 +89,8 @@ def build_proposal_writer_prompt(
     else:
         rejection_block = ""
 
-    constraints = components.constraints_template.format(rejection_examples_block=rejection_block)
+    constraints = components.constraints.format(
+        target_line_number=target_line_number, rejection_examples_block=rejection_block
+    )
 
     return "\n\n".join([components.role, task, constraints, components.output_format])
