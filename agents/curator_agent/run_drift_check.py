@@ -1,23 +1,21 @@
 """
 agents/curator_agent/run_drift_check.py
 
-Orchestrator fuer Phase 1 (Curator-Agent + Evaluator-Agent), FINALE
-Version fuer den Phase-1-MVP (2026-08-24). Ergaenzt gegenueber der
-vorherigen Version:
+Orchestrator, FINALE Version fuer Phase-1-MVP (2026-08-24, Fix 4 --
+Abschnitts-basiertes Schreiben statt Ganze-Datei-Umschreibung). Aenderung
+gegenueber der vorherigen Version, siehe Chat-Verlauf:
 
-    7. Fuer jeden approved-Vorschlag: konkreten Volltext-Vorschlag
-       erzeugen (proposal_writer.py), inkl. Few-Shot-Beispielen aus
-       bisherigen Ablehnungen (rejection_history.py)
-    8. Vorher/Nachher-Diff anzeigen (diff_presenter.py)
-    9. Human-in-the-Loop-Bestaetigung einholen (input())
-   10. Bei "ja": Datei WIRKLICH schreiben
-       Bei "nein": Ablehnungsgrund abfragen, in rejection_history speichern
+    6a. Abschnitt lokalisieren (section_locator.py) -- WELCHER Teil der
+        Datei ist tatsaechlich betroffen?
+    6b. NUR diesen Abschnitt an Ollama schicken (proposal_writer.py v2)
+    6c. Deterministische Validierung DES ERGEBNISSES (proposal_validation.py)
+        -- bei Fehlschlag: automatisch verwerfen, NICHT anzeigen
+    6d. Volltext programmatisch neu zusammensetzen (section_locator.replace_section)
+        -- der Rest der Datei bleibt garantiert byte-identisch
+    6e. Diff anzeigen, Human-in-the-Loop-Bestaetigung, Schreiben/Ablehnen
 
-WICHTIG (Nutzer-Vision, siehe Chat-Verlauf 2026-08-24): dieser manuelle
-Bestaetigungsschritt ist BEWUSST noch vorhanden und bleibt es, bis ueber
-mehrere echte Laeufe hinweg verifiziert ist, dass die Vorschlaege
-zuverlaessig akkurat sind. Ein Wegfall dieses Schritts ist eine bewusste,
-spaetere Entscheidung, KEINE automatische Weiterentwicklung.
+Diese Kette macht eine Beschaedigung unbeteiligter Abschnitte STRUKTURELL
+unmoeglich -- unabhaengig davon, was Ollama im Einzelfall tut.
 """
 
 from __future__ import annotations
@@ -31,6 +29,11 @@ from agents.curator_agent.concept_loader import (
 from agents.curator_agent.diff_presenter import build_unified_diff, has_actual_changes
 from agents.curator_agent.drift_diff import diff_concept_summaries
 from agents.curator_agent.embedding_filter_chunked import filter_candidates
+from agents.curator_agent.section_locator import (
+    find_most_relevant_section,
+    replace_section,
+    split_into_sections,
+)
 from agents.curator_agent.snapshot_store import (
     load_latest_snapshot_with_raw_texts,
     save_snapshot,
@@ -40,7 +43,8 @@ from agents.evaluator_agent.evaluator import (
     run_drift_judge,
     score_drift_judgment_heuristically,
 )
-from agents.evaluator_agent.proposal_writer import ProposalWriterError, write_proposal
+from agents.evaluator_agent.proposal_validation import validate_updated_section
+from agents.evaluator_agent.proposal_writer import ProposalWriterError, write_section_proposal
 from agents.evaluator_agent.rejection_history import (
     format_for_prompt,
     load_rejections,
@@ -84,31 +88,30 @@ def _recent_worklog_summaries(current_summary, exclude_filename: str) -> str:
 
 def _handle_human_in_the_loop(
     filename: str,
-    original_text: str,
-    written_proposal,
+    original_full_text: str,
+    updated_full_text: str,
+    change_summary: str,
     contradiction_summary: str,
     suggested_update: str,
     full_path: Path,
 ) -> None:
-    """Zeigt Diff, holt Bestaetigung ein, schreibt oder speichert Ablehnung."""
-    diff_text = build_unified_diff(original_text, written_proposal.updated_full_text, filename)
-
     print("\n" + "=" * 70)
     print(f"VORSCHAU FUER: {filename}")
     print("=" * 70)
-    print(f"Aenderungs-Zusammenfassung: {written_proposal.change_summary}\n")
+    print(f"Aenderungs-Zusammenfassung: {change_summary}\n")
 
-    if not has_actual_changes(original_text, written_proposal.updated_full_text):
+    if not has_actual_changes(original_full_text, updated_full_text):
         print("Kein tatsaechlicher Unterschied im vorgeschlagenen Text -- wird uebersprungen.")
         return
 
+    diff_text = build_unified_diff(original_full_text, updated_full_text, filename)
     print(diff_text)
     print()
 
     answer = input(f"Diesen Vorschlag fuer {filename} JETZT schreiben? (ja/nein): ").strip().lower()
 
     if answer in ("ja", "j", "yes", "y"):
-        full_path.write_text(written_proposal.updated_full_text, encoding="utf-8")
+        full_path.write_text(updated_full_text, encoding="utf-8")
         print(f"-> Geschrieben: {full_path}")
     else:
         reason = input("Kurzer Grund fuer die Ablehnung (Pflichtfeld): ").strip()
@@ -120,7 +123,7 @@ def _handle_human_in_the_loop(
             filename=filename,
             contradiction_summary=contradiction_summary,
             suggested_update=suggested_update,
-            proposed_text=written_proposal.updated_full_text,
+            proposed_text=updated_full_text,
             rejection_reason=reason,
         )
         print("-> Abgelehnt. In Ablehnungs-Historie gespeichert fuer kuenftige Prompts.")
@@ -228,35 +231,53 @@ def run() -> None:
         print("\nKeine freigegebenen Vorschlaege.")
         return
 
-    print("\nSchritt 6/6: Konkrete Textvorschlaege erzeugen + Human-in-the-Loop...")
+    print("\nSchritt 6/6: Abschnitt lokalisieren, gezielt umschreiben, validieren, Human-in-the-Loop...")
     rejections = load_rejections(REJECTION_HISTORY_ROOT, AGENT_NAME)
     rejection_examples = format_for_prompt(rejections)
 
     for candidate, judgment, scored in approved_proposals:
-        original_text = current_raw_texts.get(candidate.filename)
+        original_full_text = current_raw_texts.get(candidate.filename)
         full_path = _full_path_for_filename(current_summary.source_file_mtimes, candidate.filename)
 
-        if original_text is None or full_path is None:
+        if original_full_text is None or full_path is None:
             print(f"ABBRUCH fuer {candidate.filename}: Originaltext/Pfad nicht auffindbar.")
             continue
 
+        sections = split_into_sections(original_full_text)
+        target_section = find_most_relevant_section(
+            sections, judgment.contradiction_summary, judgment.suggested_update
+        )
+        print(f"\n  Lokalisierter Abschnitt fuer {candidate.filename}: '{target_section.heading}'")
+
         try:
-            written_proposal = write_proposal(
+            written = write_section_proposal(
                 filename=candidate.filename,
+                section_heading=target_section.heading,
+                section_text=target_section.text,
                 contradiction_summary=judgment.contradiction_summary,
                 suggested_update=judgment.suggested_update,
-                original_full_text=original_text,
                 current_project_concept=current_summary.concept_text,
                 rejection_examples=rejection_examples,
             )
         except ProposalWriterError as exc:
-            print(f"FEHLER beim Erzeugen des konkreten Vorschlags fuer {candidate.filename}: {exc}")
+            print(f"FEHLER beim Erzeugen des Abschnitts-Vorschlags fuer {candidate.filename}: {exc}")
             continue
+
+        validation = validate_updated_section(target_section.text, written.updated_section_text)
+        if not validation.passed:
+            print(f"  AUTOMATISCH VERWORFEN (deterministische Validierung fehlgeschlagen):")
+            for failure in validation.failures:
+                print(f"    - {failure}")
+            print("  Vorschlag wird NICHT angezeigt. Bitte spaeter erneut versuchen oder Prompt anpassen.")
+            continue
+
+        updated_full_text = replace_section(original_full_text, target_section, written.updated_section_text)
 
         _handle_human_in_the_loop(
             filename=candidate.filename,
-            original_text=original_text,
-            written_proposal=written_proposal,
+            original_full_text=original_full_text,
+            updated_full_text=updated_full_text,
+            change_summary=written.change_summary,
             contradiction_summary=judgment.contradiction_summary,
             suggested_update=judgment.suggested_update,
             full_path=full_path,

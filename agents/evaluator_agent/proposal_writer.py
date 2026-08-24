@@ -1,10 +1,10 @@
 """
 agents/evaluator_agent/proposal_writer.py
 
-Fuehrt den Ollama-Aufruf fuer proposal_writer_prompt.py aus und liefert
-einen konkreten, einsetzbaren neuen Volltext fuer ein Vault-Dokument.
-Analog im Aufbau zu evaluator.py (run_drift_judge), aber fuer die
-Erzeugungs- statt die Bewertungs-Aufgabe.
+VERSION 2 (2026-08-24): erzeugt jetzt nur noch den Text fuer EINEN
+Abschnitt (siehe proposal_writer_prompt.py-Docstring fuer die Begruendung
+der Aenderung). Feldname im JSON-Output entsprechend angepasst:
+updated_section_text statt updated_full_text.
 """
 
 from __future__ import annotations
@@ -25,27 +25,30 @@ class ProposalWriterError(Exception):
 
 
 @dataclass(frozen=True)
-class WrittenProposal:
+class WrittenSectionProposal:
     filename: str
-    updated_full_text: str
+    section_heading: str
+    updated_section_text: str
     change_summary: str
 
 
-def write_proposal(
+def write_section_proposal(
     filename: str,
+    section_heading: str,
+    section_text: str,
     contradiction_summary: str,
     suggested_update: str,
-    original_full_text: str,
     current_project_concept: str,
     rejection_examples: list[str] | None = None,
     model: str = DEFAULT_MODEL,
-    timeout_seconds: int = 180,
-) -> WrittenProposal:
+    timeout_seconds: int = 120,
+) -> WrittenSectionProposal:
     prompt = build_proposal_writer_prompt(
         filename=filename,
+        section_heading=section_heading,
+        section_text=section_text,
         contradiction_summary=contradiction_summary,
         suggested_update=suggested_update,
-        original_full_text=original_full_text,
         current_project_concept=current_project_concept,
         rejection_examples=rejection_examples,
     )
@@ -80,9 +83,10 @@ def write_proposal(
         ) from exc
 
     try:
-        return WrittenProposal(
+        return WrittenSectionProposal(
             filename=filename,
-            updated_full_text=parsed["updated_full_text"],
+            section_heading=section_heading,
+            updated_section_text=parsed["updated_section_text"],
             change_summary=parsed["change_summary"],
         )
     except KeyError as exc:

@@ -1,55 +1,60 @@
 """
 agents/evaluator_agent/proposal_writer_prompt.py
 
-Vierter Prompt-Baustein (nach drift_judge_prompt.py). Zweck: aus dem
-beschreibenden suggested_update-Text des Drift-Judges (Schicht 3) einen
-KONKRETEN, direkt einsetzbaren neuen Volltext fuer das betroffene Vault-
-Dokument erzeugen -- Option A aus dem Chat-Verlauf 2026-08-24: das System
-soll die Aenderung tatsaechlich SELBST formulieren, nicht nur beschreiben,
-damit spaeter (nach ausreichender Verifizierung durch den Nutzer) ein
-Schreiben ohne Human-in-the-Loop denkbar wird.
+Vierter Prompt-Baustein. VERSION 2 (2026-08-24, nach realem Testfehler --
+siehe Chat-Verlauf): erzeugt jetzt NUR den korrigierten Text fuer EINEN
+Markdown-Abschnitt, nicht mehr die ganze Datei. Der betroffene Abschnitt
+wird von section_locator.py bestimmt; der Rest der Datei wird
+PROGRAMMATISCH unveraendert wieder zusammengefuegt (siehe run_drift_check.py).
 
-WICHTIG -- Few-Shot-Lernen aus Ablehnungen (siehe Chat-Verlauf 2026-08-24):
-Dieser Prompt bekommt optional eine Liste frueherer, vom Nutzer
-ABGELEHNTER Vorschlaege mit Ablehnungsgrund als Few-Shot-Beispiele
-mitgegeben (siehe rejection_history.py). Das ist BEWUSST kein Modell-
-Finetuning (siehe Chat-Diskussion: zu wenig Datenvolumen, zu invasiv),
-sondern ein wachsender, kuratierter Beispiel-Datensatz direkt im Prompt --
-das etablierte "trace -> human review -> dataset -> re-run"-Muster aus
-der Phase-0-Recherche (Handover-Dokument, Abschnitt 4.3).
+WARUM DIESE AENDERUNG: der urspruengliche "ganze Datei neu ausgeben"-Ansatz
+fuehrte in einem echten Testlauf zu drei Fehlern gleichzeitig: (1)
+mehrere unbeteiligte Abschnitte wurden durch identischen Platzhaltertext
+ersetzt, (2) bereits abgeschlossene Phasen wurden faelschlich auf "Offen"
+zurueckgesetzt, (3) der eigene Eingabeprompt wurde ins Ergebnis geleakt.
+Kleinerer Aufgabenumfang (ein Abschnitt statt der ganzen Datei) reduziert
+das Risiko aller drei Fehlerarten strukturell.
+
+Few-Shot-Lernen aus Ablehnungen (siehe rejection_history.py) bleibt
+unveraendert bestehen.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-ROLE = """Du bist ein erfahrener Technical Writer. Du formulierst konkrete, direkt einsetzbare Aktualisierungen für Dokumente einer internen Projekt-Wissensdatenbank (Obsidian-Vault), basierend auf einer bereits getroffenen fachlichen Einschätzung."""
+ROLE = """Du bist ein erfahrener Technical Writer. Du aktualisierst EINEN einzelnen Abschnitt eines Markdown-Dokuments aus einer internen Projekt-Wissensdatenbank, basierend auf einer bereits getroffenen fachlichen Einschätzung."""
 
-TASK_TEMPLATE = """Ein Reviewer hat folgende Diskrepanz zwischen einem Vault-Dokument und dem tatsächlichen Projektstand festgestellt:
+TASK_TEMPLATE = """Ein Reviewer hat folgende Diskrepanz festgestellt, die genau diesen EINEN Abschnitt betrifft:
 
 Dateiname: {filename}
+Abschnitts-Überschrift: {section_heading}
 Widerspruch: {contradiction_summary}
 Beschreibender Verbesserungsvorschlag des Reviewers: {suggested_update}
 
-Aktueller, vollständiger Inhalt der Datei:
-{original_full_text}
+Aktueller Text NUR dieses einen Abschnitts (inklusive Überschrift):
+---BEGINN ABSCHNITT---
+{section_text}
+---ENDE ABSCHNITT---
 
-Tatsächlicher, aktueller Gesamtprojektstand:
+Tatsächlicher, aktueller Gesamtprojektstand (zur Orientierung, NICHT Teil des zu erzeugenden Texts):
 {current_project_concept}
 
-Erzeuge den VOLLSTÄNDIGEN, korrigierten Text der gesamten Datei. Übernimm alle Teile, die laut Widerspruch nicht betroffen sind, UNVERÄNDERT (exaktes Markdown-Format, Tabellen, Überschriften). Ändere NUR die Stellen, die dem festgestellten Widerspruch entsprechen."""
+Erzeuge den korrigierten Text NUR für diesen einen Abschnitt (inklusive der Überschrift-Zeile am Anfang)."""
 
 CONSTRAINTS_TEMPLATE = """Wichtige Einschränkungen:
-- Gib den GESAMTEN Dateiinhalt zurück, nicht nur den geänderten Ausschnitt.
+- Gib AUSSCHLIESSLICH den Text für DIESEN EINEN Abschnitt zurück, beginnend mit der Überschrift-Zeile.
+- Gib NICHT die ganze Datei, NICHT andere Abschnitte, NICHT den obigen Projektstand-Text zurück.
 - Erfinde KEINE Fakten, die nicht im "tatsächlichen Projektstand" oben belegt sind.
-- Behalte Formatierung, Struktur und Stil des Originals so weit wie möglich bei.
-- Ändere nur, was durch den Widerspruch begründet ist -- keine unnötigen Umformulierungen anderer Abschnitte.
+- Behalte Formatierung und Stil des Originals bei (Tabellen, Aufzählungen, Markdown-Syntax).
+- Ändere nur, was durch den Widerspruch begründet ist.
+- Falls eine Phase laut Original bereits "Abgeschlossen" war, darf der Status NIE rückwärts auf "Offen" gesetzt werden -- nur der ECHTE, im Projektstand belegte Status darf eingetragen werden.
 {rejection_examples_block}"""
 
 OUTPUT_FORMAT = """Antworte ausschließlich mit einem JSON-Objekt exakt in dieser Struktur:
 
 {
-  "updated_full_text": "der komplette neue Dateiinhalt als einzelner String, mit \\n für Zeilenumbrüche",
+  "updated_section_text": "der korrigierte Text NUR dieses Abschnitts, mit \\n für Zeilenumbrüche",
   "change_summary": "1-2 Sätze, was konkret geändert wurde"
 }"""
 
@@ -64,24 +69,22 @@ class ProposalWriterPromptComponents:
 
 def build_proposal_writer_prompt(
     filename: str,
+    section_heading: str,
+    section_text: str,
     contradiction_summary: str,
     suggested_update: str,
-    original_full_text: str,
     current_project_concept: str,
     rejection_examples: list[str] | None = None,
     components: ProposalWriterPromptComponents | None = None,
 ) -> str:
-    """Baut den finalen Prompt. rejection_examples ist eine Liste bereits
-    fertig formatierter Few-Shot-Text-Bloecke (siehe rejection_history.py,
-    format_for_prompt()) -- dieses Modul kennt das Speicherformat der
-    Ablehnungs-Historie bewusst NICHT, um die Kopplung locker zu halten."""
     components = components or ProposalWriterPromptComponents()
 
     task = components.task_template.format(
         filename=filename,
+        section_heading=section_heading or "(kein Überschrift-Text, Anfang der Datei)",
+        section_text=section_text,
         contradiction_summary=contradiction_summary,
         suggested_update=suggested_update,
-        original_full_text=original_full_text,
         current_project_concept=current_project_concept,
     )
 
