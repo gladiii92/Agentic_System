@@ -2,22 +2,19 @@
 agents/curator_agent/run_drift_check.py
 
 Orchestrator fuer Phase 1 (Curator-Agent + Evaluator-Agent, komplette
-Kaskade). Fuehrt EINEN kompletten manuellen Durchlauf aus:
+Kaskade). Version 2026-08-24: Schicht 2 nutzt jetzt echte Rohtext-Historie
+statt Zusammenfassungs-Vergleich (siehe embedding_filter.py-Docstring).
 
-    1. Frischen concept_summary-Lauf ueber AI_Project_Reviewer anstossen
-       und laden (concept_loader.py)
-    2. Vorherigen eigenen Snapshot laden, falls vorhanden (snapshot_store.py)
+Ablauf:
+    1. Frischer concept_summary-Lauf (concept_loader.py)
+    2. Vorherigen Snapshot INKL. Rohtext-Historie laden (snapshot_store.py)
     3. Schicht 1 -- deterministischer mtime-Diff (drift_diff.py)
-    4. Schicht 2 -- Embedding-Aehnlichkeits-Filter (embedding_filter.py)
+    4. Schicht 2 -- Rohtext-Embedding-Aehnlichkeits-Filter (embedding_filter.py)
     5. Schicht 3 -- LLM-Judge pro durchgelassenem Kandidaten (evaluator.py)
-    6. Vier-Kriterien-Scoring pro Judgment, NUR approved-Vorschlaege werden
-       dir angezeigt (evaluator.py score_drift_judgment_heuristically)
-    7. Aktuellen Stand als neuen Snapshot sichern (snapshot_store.py)
+    6. Vier-Kriterien-Scoring, NUR approved-Vorschlaege werden angezeigt
+    7. Aktuellen Stand (inkl. Rohtexte) als neuen Snapshot sichern
 
-WICHTIG: Dieses Skript SCHREIBT NICHTS ins FIS-Vault. Es zeigt dir nur
-an, was der Evaluator freigegeben hat -- das tatsaechliche Schreiben der
-ROADMAP.md o.ae. ist ein spaeterer Baustein (Human-in-the-Loop-
-Bestaetigung + Schreibvorgang), bewusst noch nicht Teil dieser Phase.
+WICHTIG: Dieses Skript SCHREIBT NICHTS ins FIS-Vault.
 """
 
 from __future__ import annotations
@@ -30,7 +27,10 @@ from agents.curator_agent.concept_loader import (
 )
 from agents.curator_agent.drift_diff import diff_concept_summaries
 from agents.curator_agent.embedding_filter import filter_candidates
-from agents.curator_agent.snapshot_store import load_latest_snapshot, save_snapshot
+from agents.curator_agent.snapshot_store import (
+    load_latest_snapshot_with_raw_texts,
+    save_snapshot,
+)
 from agents.evaluator_agent.evaluator import (
     EvaluatorError,
     run_drift_judge,
@@ -42,12 +42,21 @@ CURATOR_DATA_ROOT = Path(r"G:\DAVID\Desktop\GitHub\Agentic_System\data")
 TARGET_PROJECT_NAME = "AI_Project_Reviewer"
 
 
+def _read_current_raw_texts(source_file_mtimes: dict[str, float]) -> dict[str, str]:
+    """Analog zu snapshot_store._read_raw_texts, aber hier separat
+    gehalten, weil der Orchestrator die Rohtexte VOR dem Speichern schon
+    fuer Schicht 2 braucht (Reihenfolge: erst vergleichen, dann speichern)."""
+    raw_texts: dict[str, str] = {}
+    for full_path in source_file_mtimes:
+        filename = Path(full_path).name
+        try:
+            raw_texts[filename] = Path(full_path).read_text(encoding="utf-8")
+        except OSError as exc:
+            raw_texts[filename] = f"__READ_ERROR__: {exc}"
+    return raw_texts
+
+
 def _recent_worklog_summaries(current_summary, exclude_filename: str) -> str:
-    """Baut den Zusatzkontext fuer den Judge-Prompt: Text aus allen
-    Worklog-Dokumenten AUSSER dem aktuell geprueften Dokument selbst.
-    Bewusst simple Heuristik ueber den Dateinamen ("Worklog" im Namen) --
-    reicht fuer Phase 1, kann spaeter verfeinert werden (z.B. echte
-    zeitliche Sortierung statt Namens-Heuristik)."""
     parts = []
     for doc in current_summary.document_summaries:
         if doc.path == exclude_filename:
@@ -72,12 +81,15 @@ def run() -> None:
         return
 
     print(f"  -> {len(current_summary.document_summaries)} Dokument(e) zusammengefasst.")
+    current_raw_texts = _read_current_raw_texts(current_summary.source_file_mtimes)
 
-    print("Schritt 2/6: Vorherigen Snapshot laden...")
-    previous_summary = load_latest_snapshot(CURATOR_DATA_ROOT, TARGET_PROJECT_NAME)
-    if previous_summary is None:
+    print("Schritt 2/6: Vorherigen Snapshot (inkl. Rohtext-Historie) laden...")
+    previous_result = load_latest_snapshot_with_raw_texts(CURATOR_DATA_ROOT, TARGET_PROJECT_NAME)
+    if previous_result is None:
+        previous_summary, previous_raw_texts = None, {}
         print("  -> Kein vorheriger Snapshot gefunden (erster Lauf fuer dieses Projekt).")
     else:
+        previous_summary, previous_raw_texts = previous_result
         print(f"  -> Vorheriger Snapshot vom {previous_summary.generated_at} geladen.")
 
     print("Schritt 3/6: Schicht 1 -- deterministischer mtime-Diff...")
@@ -99,8 +111,12 @@ def run() -> None:
         print("\nKeine Aenderungen seit letztem Snapshot erkannt. Fertig.")
         return
 
-    print("Schritt 4/6: Schicht 2 -- Embedding-Aehnlichkeits-Filter...")
-    embedding_results = filter_candidates(diff_result.candidates)
+    print("Schritt 4/6: Schicht 2 -- Rohtext-Embedding-Aehnlichkeits-Filter...")
+    embedding_results = filter_candidates(
+        diff_result.candidates,
+        previous_raw_texts=previous_raw_texts,
+        current_raw_texts=current_raw_texts,
+    )
     passed_candidates = [r.candidate for r in embedding_results if r.passed]
 
     for r in embedding_results:
@@ -147,8 +163,7 @@ def run() -> None:
     print("=" * 70)
 
     if not approved_proposals:
-        print("Keine freigegebenen Vorschlaege. Entweder kein echter Drift erkannt,")
-        print("oder alle Kandidaten wurden vom Evaluator als nicht ausreichend bewertet.")
+        print("Keine freigegebenen Vorschlaege.")
         return
 
     for judgment, scored in approved_proposals:
