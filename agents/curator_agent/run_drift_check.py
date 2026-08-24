@@ -1,30 +1,14 @@
 """
 agents/curator_agent/run_drift_check.py
 
-Orchestrator, VERSION 2026-08-24 -- grundlegender Umbau auf zeilengenaue,
-Finding-fuer-Finding-Verarbeitung (siehe Chat-Verlauf: Nutzer-Anforderung
-"exakte Stelle identifizieren, Kontext davor/danach, von Aenderung zu
-Aenderung, egal wie viele").
-
-NEUER ABLAUF (Schritt 5+6 grundlegend anders als in Vorversionen):
-    5. Judge liefert eine LISTE von DriftFinding (je mit exakter
-       line_number), nicht mehr ein einzelnes Urteil pro Dokument.
-    6. Fuer JEDES Finding einzeln:
-       a. Score berechnen, bei approved=False dieses Finding uebergehen
-       b. Kontext-Ausschnitt um die exakte Zeile extrahieren (5 Zeilen
-          davor/danach, line_context_extractor.py)
-       c. NUR diesen Ausschnitt an den Writer schicken
-       d. Deterministisch validieren
-       e. Bei Erfolg: Human-in-the-Loop pro Einzeloeanderung
-       f. Bei Bestaetigung ("ja"): NUR dieser eine Ausschnitt wird in die
-          Datei geschrieben, BEVOR das naechste Finding bearbeitet wird
-          (Datei wird zwischen Findings neu von der Platte gelesen, damit
-          Zeilennummern nachfolgender Findings, die VOR der geschriebenen
-          Aenderung im Dokument liegen, konsistent bleiben -- Findings
-          werden deshalb nach line_number ABSTEIGEND sortiert bearbeitet,
-          siehe _findings_sorted_descending, damit ein frueh geschriebener
-          Vorschlag die Zeilennummern SPAETERER, noch ausstehender
-          Findings nicht verschiebt).
+VERSION 2026-08-24, Debug-Ergaenzung: zeigt jetzt reasoning UND
+contradiction_summary auch fuer VERWORFENE Findings an (bisher nur fuer
+approved-Findings implizit ueber den Writer-Schritt sichtbar). Grund
+(siehe Chat-Verlauf): Score 6.20 bei einer eigentlich offensichtlichen
+Diskrepanz ("Alle Phasen abgeschlossen" vs. echter Stand) wirkte zu
+niedrig -- ohne reasoning/contradiction_summary in der Ausgabe konnte
+nicht beurteilt werden, ob das am Judge-Urteil oder an der Score-
+Uebersetzung liegt.
 """
 
 from __future__ import annotations
@@ -93,10 +77,6 @@ def _recent_worklog_summaries(current_summary, exclude_filename: str) -> str:
 
 
 def _findings_sorted_descending(findings: list[DriftFinding]) -> list[DriftFinding]:
-    """Sortiert nach line_number ABSTEIGEND (siehe Modul-Docstring): wenn
-    wir von unten nach oben durch die Datei arbeiten, veraendert das
-    Schreiben eines Vorschlags weiter unten NIE die Zeilennummern der noch
-    ausstehenden Findings weiter oben."""
     return sorted(findings, key=lambda f: f.line_number, reverse=True)
 
 
@@ -107,19 +87,13 @@ def _handle_single_finding(
     current_project_concept: str,
     rejection_examples: list[str],
 ) -> None:
-    """Verarbeitet EIN einzelnes Finding komplett: Kontext extrahieren,
-    schreiben lassen, validieren, Human-in-the-Loop, ggf. Datei aktualisieren.
-    Liest die Datei am ANFANG frisch von der Platte, damit vorherige, in
-    diesem selben Lauf bereits geschriebene Aenderungen beruecksichtigt
-    sind."""
     current_full_text = full_path.read_text(encoding="utf-8")
     total_lines = len(current_full_text.splitlines())
 
     if finding.line_number < 1 or finding.line_number > total_lines:
         print(
             f"    UEBERSPRUNGEN: Zeile {finding.line_number} liegt ausserhalb des "
-            f"aktuellen Dokuments (1-{total_lines}) -- vermutlich durch eine vorherige "
-            f"Aenderung in diesem Lauf verschoben oder Judge-Fehler."
+            f"aktuellen Dokuments (1-{total_lines})."
         )
         return
 
@@ -271,10 +245,11 @@ def run() -> None:
         approved_findings = []
         for finding in findings:
             scored = score_finding_heuristically(finding)
-            print(
-                f"    Zeile {finding.line_number} ({finding.severity}): "
-                f"Score {scored.weighted_score:.2f}, approved={scored.approved}"
-            )
+            print(f"\n    Zeile {finding.line_number} ({finding.severity}):")
+            print(f"      Begruendung: {finding.reasoning}")
+            print(f"      Widerspruch: {finding.contradiction_summary}")
+            print(f"      Vorschlag: {finding.suggested_update}")
+            print(f"      Score: {scored.weighted_score:.2f}, approved={scored.approved}")
             if scored.approved:
                 approved_findings.append(finding)
             else:
