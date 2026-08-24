@@ -1,26 +1,24 @@
 """
 agents/curator_agent/section_locator.py
 
-Zerlegt ein Markdown-Dokument in Abschnitte (getrennt durch "## "-
-Ueberschriften der obersten Ebene, analog zur beobachteten Struktur von
-ROADMAP.md: "## Phase X - ...") und identifiziert, welcher Abschnitt am
-ehesten zur festgestellten Diskrepanz passt.
+VERSION 2 (2026-08-24, Fix 6 -- robustere Abschnitts-Lokalisierung nach
+realem Fehlerfall, siehe Chat-Verlauf): Version 1 nutzte reine Wort-
+ueberlappung zwischen Judge-Begruendung und Abschnittstext -- das waehlte
+in einem echten Testlauf den FALSCHEN Abschnitt ("MVP-Definition" statt
+der eigentlichen Phasen-Tabelle), weil beide Abschnitte aehnliche
+thematische Woerter (Ruff, Bandit, Ollama) enthalten.
 
-WARUM DIESER BAUSTEIN NEU IST (siehe Chat-Verlauf 2026-08-24): Der erste
-echte Testlauf des proposal_writer-Moduls zeigte, dass ein "gib die ganze
-Datei neu aus"-Ansatz bei laengeren Dokumenten unzuverlaessig ist --
-Ollama ersetzte mehrere unbeteiligte Phasen-Abschnitte durch identischen
-Platzhaltertext und leckte den eigenen Prompt ins Ergebnis. Die robuste
-Loesung: NUR den tatsaechlich betroffenen Abschnitt an Ollama schicken,
-den Rest der Datei PROGRAMMATISCH (nicht durchs Modell) unveraendert
-zusammenfuegen -- das macht eine Beschaedigung anderer Abschnitte
-STRUKTURELL unmoeglich, unabhaengig davon, was das Modell tut.
+FIX 1 -- Status-Keyword-Bonus: Abschnitte, die Status-Schluesselwoerter
+("Abgeschlossen", "Offen", "Status:", Tabellen-Pipe-Zeichen "|") enthalten,
+bekommen einen Bonus -- Drift-Faelle drehen sich fast immer um FALSCHE
+STATUSANGABEN, also sind Abschnitte mit Status-Tabellen die wahrschein-
+licheren Ziele als reine Beschreibungstexte.
 
-Bewusst einfache Heuristik (TF-IDF-artiger Wortueberlappungs-Score
-zwischen contradiction_summary und jedem Abschnittstext) statt Embedding
--- fuer diese Lokalisierungsaufgabe reicht ein einfacher, deterministischer
-Score, kein weiteres ML-Modell noetig (Prinzip: einfachste ausreichende
-Loesung zuerst, siehe Kaskaden-Philosophie aus embedding_filter.py).
+FIX 2 -- Trennlinien-Erhaltung beim Zusammenfuegen: replace_section()
+stellt jetzt sicher, dass zwischen dem neuen Abschnittstext und dem
+nachfolgenden Text mindestens die im Original vorhandene Anzahl
+Zeilenumbrueche erhalten bleibt (verhindert das beobachtete Verschmelzen
+von "## MVP-Definition" und "## Phase 1" durch fehlende Leerzeile/---).
 """
 
 from __future__ import annotations
@@ -29,6 +27,8 @@ import re
 from dataclasses import dataclass
 
 SECTION_HEADING_PATTERN = re.compile(r"^## .+$", re.MULTILINE)
+STATUS_KEYWORDS = ["abgeschlossen", "offen", "status:", "nächster schritt"]
+STATUS_BONUS_WEIGHT = 0.5  # zusaetzlicher Score-Anteil pro erkanntem Status-Keyword-Treffer
 
 
 @dataclass(frozen=True)
@@ -40,9 +40,6 @@ class DocumentSection:
 
 
 def split_into_sections(full_text: str) -> list[DocumentSection]:
-    """Teilt den Text an jeder Zeile, die mit '## ' beginnt. Text VOR der
-    ersten Ueberschrift wird als eigener Abschnitt mit heading='' behandelt
-    (z.B. Titel/Intro-Text vor der ersten Phase in ROADMAP.md)."""
     matches = list(SECTION_HEADING_PATTERN.finditer(full_text))
 
     if not matches:
@@ -66,9 +63,6 @@ def split_into_sections(full_text: str) -> list[DocumentSection]:
 
 
 def _word_overlap_score(text_a: str, text_b: str) -> float:
-    """Einfacher, deterministischer Ueberlappungs-Score: Anteil der Woerter
-    aus text_a, die auch in text_b vorkommen (case-insensitiv, nur Woerter
-    ab 4 Zeichen, um Fuellwoerter zu ignorieren)."""
     words_a = {w.lower() for w in re.findall(r"\w{4,}", text_a)}
     words_b = {w.lower() for w in re.findall(r"\w{4,}", text_b)}
 
@@ -79,15 +73,30 @@ def _word_overlap_score(text_a: str, text_b: str) -> float:
     return len(overlap) / len(words_a)
 
 
+def _status_keyword_bonus(section_text: str, query: str) -> float:
+    """Bonus NUR, wenn sowohl der Abschnitt ALS AUCH die Judge-Begruendung
+    (query) Status-Sprache verwenden -- verhindert, dass EIN generischer
+    Abschnitt allein durch eigene Status-Woerter bevorzugt wird, ohne dass
+    die Anfrage selbst nach Status fragt."""
+    query_lower = query.lower()
+    section_lower = section_text.lower()
+
+    query_mentions_status = any(kw in query_lower for kw in STATUS_KEYWORDS)
+    if not query_mentions_status:
+        return 0.0
+
+    matches = sum(1 for kw in STATUS_KEYWORDS if kw in section_lower)
+    pipe_bonus = 0.3 if "|" in section_text else 0.0  # Tabellen-Indikator
+    return min(matches * STATUS_BONUS_WEIGHT + pipe_bonus, 1.5)
+
+
 def find_most_relevant_section(
     sections: list[DocumentSection],
     contradiction_summary: str,
     suggested_update: str,
 ) -> DocumentSection:
-    """Findet den Abschnitt mit der hoechsten Wortueberlappung zum
-    kombinierten Text aus contradiction_summary + suggested_update. Bei
-    Gleichstand wird der ERSTE Treffer gewaehlt (deterministisch,
-    reproduzierbar)."""
+    """Kombiniert Wortueberlappung MIT Status-Keyword-Bonus (siehe Fix 1
+    oben). Bei Gleichstand wird der ERSTE Treffer gewaehlt."""
     query = f"{contradiction_summary} {suggested_update}"
 
     best_section = sections[0]
@@ -95,17 +104,28 @@ def find_most_relevant_section(
 
     for section in sections:
         if not section.heading:
-            continue  # Intro-Text vor der ersten Ueberschrift wird nie als Ziel gewaehlt
-        score = _word_overlap_score(query, section.text)
-        if score > best_score:
-            best_score = score
+            continue
+        overlap_score = _word_overlap_score(query, section.text)
+        bonus = _status_keyword_bonus(section.text, query)
+        total_score = overlap_score + bonus
+
+        if total_score > best_score:
+            best_score = total_score
             best_section = section
 
     return best_section
 
 
 def replace_section(full_text: str, section: DocumentSection, new_section_text: str) -> str:
-    """Setzt den Volltext programmatisch neu zusammen: alles vor/nach dem
-    Zielabschnitt bleibt BYTE-IDENTISCH zum Original, nur der Zielabschnitt
-    wird ersetzt. Das ist die eigentliche Sicherheitsgarantie dieses Moduls."""
+    """Setzt den Volltext programmatisch neu zusammen. FIX 2 (siehe Modul-
+    Docstring): stellt sicher, dass die Anzahl der Zeilenumbrueche am Ende
+    von new_section_text mindestens der im Original entspricht, bevor der
+    nachfolgende Text angehaengt wird -- verhindert das Verschmelzen von
+    Abschnitten durch fehlende Leerzeilen/Trennlinien."""
+    original_trailing_newlines = len(section.text) - len(section.text.rstrip("\n"))
+    new_trailing_newlines = len(new_section_text) - len(new_section_text.rstrip("\n"))
+
+    if new_trailing_newlines < original_trailing_newlines:
+        new_section_text = new_section_text.rstrip("\n") + "\n" * original_trailing_newlines
+
     return full_text[: section.start_index] + new_section_text + full_text[section.end_index :]
