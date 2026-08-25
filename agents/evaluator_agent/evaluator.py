@@ -1,19 +1,14 @@
 """
 agents/evaluator_agent/evaluator.py
 
-VERSION 2 (2026-08-24, zeilengenauer Umbau -- siehe Chat-Verlauf). Statt
-eines einzelnen DriftJudgment liefert run_drift_judge() jetzt eine LISTE
-von DriftFinding-Objekten, jeweils mit exakter line_number. Das
-Scoring-Schema (score_proposal, CRITERIA_WEIGHTS) bleibt unveraendert
-(bewaehrt, kein Grund zur Aenderung), wird aber jetzt PRO EINZELFINDING
-angewendet statt pro Dokument.
+VERSION 3 (2026-08-25, Hunk-basierter Umbau -- siehe Chat-Verlauf).
+run_drift_judge() bewertet jetzt EINEN einzelnen DiffHunk (aus
+diff_hunks.py) und liefert EIN Urteil zurueck (nicht mehr eine offene
+Liste von Findings ueber die ganze Datei -- Version 2 fuehrte zu
+Uebergeneralisierung, siehe drift_judge_prompt.py-Docstring).
 
-DEFAULT_MODEL: zurueckgewechselt auf qwen2.5-coder:latest (siehe
-Chat-Verlauf 2026-08-24 -- realer A/B-Test zeigte, dass die Coder-Variante
-bei dieser strukturierten Analyse-Aufgabe zuverlaessiger Drift erkennt
-als die reine Text-Variante qwen2.5:latest. Fuer den SCHREIB-Vorgang
-(proposal_writer.py) bleibt weiterhin qwen2.5:latest -- unterschiedliche
-Aufgaben, unterschiedliche beobachtete Staerken, siehe jeweilige Docstrings).
+DEFAULT_MODEL bleibt qwen2.5-coder:latest (bewaehrt fuer die
+Analyse-Aufgabe, siehe Chat-Verlauf A/B-Test 2026-08-24).
 """
 
 from __future__ import annotations
@@ -23,7 +18,7 @@ from dataclasses import dataclass
 
 import requests
 
-from agents.evaluator_agent.drift_judge_prompt import build_drift_judge_prompt, number_lines
+from agents.evaluator_agent.drift_judge_prompt import build_drift_judge_prompt
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 DEFAULT_MODEL = "qwen2.5-coder:latest"
@@ -34,34 +29,27 @@ class EvaluatorError(Exception):
 
 
 @dataclass(frozen=True)
-class DriftFinding:
-    filename: str
-    line_number: int
-    reasoning: str
+class HunkJudgment:
+    is_meaningful: bool
+    is_supported: bool  # True = Text ist durch Projektstand belegt/neutral, KEIN Widerspruch
     severity: str
+    reasoning: str
     contradiction_summary: str
-    suggested_update: str
 
 
 def run_drift_judge(
     filename: str,
-    full_document_text: str,
+    hunk_diff_text: str,
     current_project_concept: str,
     recent_worklog_summaries: str,
     model: str = DEFAULT_MODEL,
-    timeout_seconds: int = 180,
-) -> list[DriftFinding]:
-    """Fuehrt EINEN Ollama-Aufruf fuer EIN Dokument aus, liefert aber
-    potenziell MEHRERE Findings zurueck (eines pro erkannter Diskrepanz-
-    Zeile). full_document_text ist jetzt der VOLLE Rohtext der Datei
-    (nicht mehr nur die Ollama-Zusammenfassung, siehe drift_judge_prompt.py
-    Version 2 -- der Judge braucht den echten Text fuer echte
-    Zeilennummern)."""
-    numbered_text = number_lines(full_document_text)
-
+    timeout_seconds: int = 90,
+) -> HunkJudgment:
+    """Bewertet EINEN Hunk. Wird von run_drift_check.py fuer JEDEN
+    DiffHunk einzeln aufgerufen."""
     prompt = build_drift_judge_prompt(
         filename=filename,
-        numbered_document_text=numbered_text,
+        hunk_diff_text=hunk_diff_text,
         current_project_concept=current_project_concept,
         recent_worklog_summaries=recent_worklog_summaries,
     )
@@ -80,9 +68,7 @@ def run_drift_judge(
         )
         response.raise_for_status()
     except requests.exceptions.ConnectionError as exc:
-        raise EvaluatorError(
-            "Ollama nicht erreichbar unter localhost:11434. Ist ollama serve gestartet?"
-        ) from exc
+        raise EvaluatorError("Ollama nicht erreichbar unter localhost:11434.") from exc
     except requests.exceptions.Timeout as exc:
         raise EvaluatorError(f"Ollama Timeout nach {timeout_seconds}s fuer {filename}.") from exc
     except requests.exceptions.HTTPError as exc:
@@ -97,30 +83,22 @@ def run_drift_judge(
             f"Ollama-Antwort fuer {filename} ist kein valides JSON:\n{raw_text[:500]}"
         ) from exc
 
-    findings = []
     try:
-        for item in parsed.get("findings", []):
-            findings.append(
-                DriftFinding(
-                    filename=filename,
-                    line_number=int(item["line_number"]),
-                    reasoning=item["reasoning"],
-                    severity=item["severity"],
-                    contradiction_summary=item["contradiction_summary"],
-                    suggested_update=item["suggested_update"],
-                )
-            )
-    except (KeyError, ValueError, TypeError) as exc:
+        return HunkJudgment(
+            is_meaningful=bool(parsed["is_meaningful"]),
+            is_supported=bool(parsed["is_supported"]),
+            severity=parsed["severity"],
+            reasoning=parsed["reasoning"],
+            contradiction_summary=parsed.get("contradiction_summary", ""),
+        )
+    except KeyError as exc:
         raise EvaluatorError(
-            f"Ollama-Antwort fuer {filename} hat unerwartetes Finding-Format: {exc}.\n"
-            f"Rohantwort: {raw_text[:500]}"
+            f"Ollama-Antwort fuer {filename} fehlt erwartetes Feld: {exc}.\nRohantwort: {raw_text[:500]}"
         ) from exc
-
-    return findings
 
 
 # ---------------------------------------------------------------------------
-# Vier-Kriterien-Scoring-Schema (unveraendert, wird jetzt PRO FINDING genutzt)
+# Vier-Kriterien-Scoring-Schema (unveraendert seit 2026-08-22, bewaehrt)
 # ---------------------------------------------------------------------------
 
 CRITERIA_WEIGHTS = {
@@ -154,12 +132,10 @@ def score_proposal(criterion_scores: list[CriterionScore]) -> ScoredProposal:
     expected_names = set(CRITERIA_WEIGHTS.keys())
     if provided_names != expected_names:
         raise EvaluatorError(
-            f"score_proposal erwartet genau die Kriterien {expected_names}, "
-            f"erhalten: {provided_names}."
+            f"score_proposal erwartet genau die Kriterien {expected_names}, erhalten: {provided_names}."
         )
 
     weighted_score = sum(c.score * CRITERIA_WEIGHTS[c.name] for c in criterion_scores)
-
     low_scoring = [c for c in criterion_scores if c.score < MIN_SINGLE_CRITERION_SCORE]
 
     if low_scoring:
@@ -184,28 +160,18 @@ def score_proposal(criterion_scores: list[CriterionScore]) -> ScoredProposal:
     )
 
 
-def score_finding_heuristically(finding: DriftFinding) -> ScoredProposal:
-    """Analog zur bisherigen score_drift_judgment_heuristically, jetzt auf
-    ein einzelnes DriftFinding angewendet (es gibt kein has_drift=False-
-    Findings mehr -- ein Finding EXISTIERT nur, wenn der Judge tatsaechlich
-    einen Widerspruch fand; die leere findings-Liste im "kein Drift"-Fall
-    wird bereits vom Aufrufer in run_drift_check.py behandelt)."""
+def score_judgment_heuristically(judgment: HunkJudgment) -> ScoredProposal:
+    """Wird NUR aufgerufen, wenn judgment.is_supported=False (also ein
+    echter Widerspruch behauptet wird) UND judgment.is_meaningful=True --
+    triviale/neutrale Hunks werden bereits in run_drift_check.py vorher
+    aussortiert, ohne ueberhaupt gescored zu werden."""
     severity_to_score = {"LOW": 5.0, "MEDIUM": 7.0, "HIGH": 9.0}
-    base_score = severity_to_score.get(finding.severity, 5.0)
-
-    has_concrete_suggestion = bool(finding.suggested_update.strip())
+    base_score = severity_to_score.get(judgment.severity, 5.0)
 
     return score_proposal(
         [
-            CriterionScore(
-                "faktentreue", base_score, f"Judge-Severity: {finding.severity}. {finding.contradiction_summary}"
-            ),
-            CriterionScore(
-                "vollstaendigkeit",
-                base_score if has_concrete_suggestion else base_score - 3.0,
-                "Konkreter Update-Vorschlag vorhanden." if has_concrete_suggestion
-                else "Kein konkreter Update-Vorschlag vom Judge geliefert.",
-            ),
+            CriterionScore("faktentreue", base_score, judgment.contradiction_summary),
+            CriterionScore("vollstaendigkeit", base_score, judgment.reasoning),
             CriterionScore("konsistenz", 8.0, "Noch nicht gegen Tagging-/Linking-Konventionen geprueft."),
             CriterionScore("sicherheit", 9.0, "Nur ein Vorschlag, keine automatische Schreiboperation."),
         ]

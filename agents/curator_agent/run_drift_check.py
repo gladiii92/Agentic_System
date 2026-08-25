@@ -1,14 +1,39 @@
 """
 agents/curator_agent/run_drift_check.py
 
-VERSION 2026-08-24, Debug-Ergaenzung: zeigt jetzt reasoning UND
-contradiction_summary auch fuer VERWORFENE Findings an (bisher nur fuer
-approved-Findings implizit ueber den Writer-Schritt sichtbar). Grund
-(siehe Chat-Verlauf): Score 6.20 bei einer eigentlich offensichtlichen
-Diskrepanz ("Alle Phasen abgeschlossen" vs. echter Stand) wirkte zu
-niedrig -- ohne reasoning/contradiction_summary in der Ausgabe konnte
-nicht beurteilt werden, ob das am Judge-Urteil oder an der Score-
-Uebersetzung liegt.
+VERSION 2026-08-25 -- KOMPLETTER ARCHITEKTUR-UMBAU (siehe Chat-Verlauf,
+Recherche-Zusammenfassung "robuste Patch-Architektur" nach mehreren
+gescheiterten Freitext-Schreibversuchen).
+
+NEUER, ROBUSTER ABLAUF:
+    1. Frischer concept_summary-Lauf (concept_loader.py, unveraendert)
+    2. Vorherigen Snapshot INKL. Rohtext-Historie laden (snapshot_store.py,
+       unveraendert)
+    3. Schicht 1 -- deterministischer mtime-Diff (drift_diff.py, unveraendert)
+       -- entscheidet NUR, ob sich ueberhaupt eine Datei geaendert hat.
+    4. NEU -- diff_hunks.py: deterministischer Zeilen-Diff zwischen altem
+       und neuem Rohtext DERSELBEN Datei. Liefert PRAEZISE Aenderungs-
+       bloecke, OHNE jeden Rate-/Embedding-Schritt.
+    5. Fuer JEDEN Hunk: Judge bewertet NUR diesen einen Hunk (is_meaningful,
+       is_supported). Triviale/neutrale Hunks werden SOFORT verworfen,
+       OHNE Scoring, OHNE Schreibversuch.
+    6. Fuer jeden als "nicht belegt" (echter Widerspruch) bewerteten Hunk:
+       Scoring (bewaehrtes 4-Kriterien-Schema), dann Patch-Writer erzeugt
+       EXAKTES exact_old_text/replacement_text-Paar (patch_writer.py).
+    7. patch_validator.py: harte, deterministische Pruefung (exact_old_text
+       muss GENAU EINMAL im Dokument vorkommen, Laengenverhaeltnis, keine
+       Prompt-Leak-Marker). NUR bestandene Patches werden angezeigt.
+    8. Human-in-the-Loop pro Patch, Anwendung via patch_applier.py
+       (reine, sichere String-Ersetzung).
+
+ENTFERNTE MODULE (siehe Chat-Verlauf, koennen geloescht werden):
+    - section_locator.py (Abschnitts-Lokalisierung per Wortueberlappung)
+    - embedding_filter.py (Embedding-Aehnlichkeit als Vorfilter)
+    - line_context_extractor.py (Zeilennummer-Kontext-Ausschnitt)
+    - proposal_writer.py / proposal_writer_prompt.py (Freitext-Schreiben)
+    - proposal_validation.py (schwaechere Laengen-/Marker-Validierung)
+    Begruendung jeweils: durch den deterministischen Diff-Hunk +
+    exact-match-Patch-Ansatz vollstaendig und robuster ersetzt.
 """
 
 from __future__ import annotations
@@ -19,27 +44,26 @@ from agents.curator_agent.concept_loader import (
     ConceptSummaryLoadError,
     refresh_and_load,
 )
-from agents.curator_agent.diff_presenter import build_unified_diff, has_actual_changes
+from agents.curator_agent.diff_presenter import build_unified_diff
 from agents.curator_agent.drift_diff import diff_concept_summaries
-from agents.curator_agent.embedding_filter_chunked import filter_candidates
-from agents.curator_agent.line_context_extractor import extract_context, replace_context_in_full_text
 from agents.curator_agent.snapshot_store import (
     load_latest_snapshot_with_raw_texts,
     save_snapshot,
 )
 from agents.evaluator_agent.evaluator import (
-    DriftFinding,
     EvaluatorError,
     run_drift_judge,
-    score_finding_heuristically,
+    score_judgment_heuristically,
 )
-from agents.evaluator_agent.proposal_validation import validate_updated_context
-from agents.evaluator_agent.proposal_writer import ProposalWriterError, write_context_proposal
+from agents.evaluator_agent.patch_writer import PatchWriterError, write_patch
 from agents.evaluator_agent.rejection_history import (
     format_for_prompt,
     load_rejections,
     record_rejection,
 )
+from patching.diff_hunks import compute_diff_hunks, render_hunk_for_prompt
+from patching.patch_applier import apply_patch
+from patching.patch_validator import validate_patch
 
 AI_PROJECT_REVIEWER_REPO_PATH = Path(r"G:\DAVID\Desktop\GitHub\AI_Project_Reviewer")
 CURATOR_DATA_ROOT = Path(r"G:\DAVID\Desktop\GitHub\Agentic_System\data")
@@ -76,71 +100,86 @@ def _recent_worklog_summaries(current_summary, exclude_filename: str) -> str:
     return "\n".join(parts)
 
 
-def _findings_sorted_descending(findings: list[DriftFinding]) -> list[DriftFinding]:
-    return sorted(findings, key=lambda f: f.line_number, reverse=True)
-
-
-def _handle_single_finding(
+def _handle_hunk(
     filename: str,
     full_path: Path,
-    finding: DriftFinding,
+    hunk,
     current_project_concept: str,
+    recent_worklogs: str,
     rejection_examples: list[str],
 ) -> None:
-    current_full_text = full_path.read_text(encoding="utf-8")
-    total_lines = len(current_full_text.splitlines())
-
-    if finding.line_number < 1 or finding.line_number > total_lines:
-        print(
-            f"    UEBERSPRUNGEN: Zeile {finding.line_number} liegt ausserhalb des "
-            f"aktuellen Dokuments (1-{total_lines})."
-        )
-        return
-
-    context = extract_context(current_full_text, finding.line_number)
+    hunk_text = render_hunk_for_prompt(hunk)
 
     try:
-        written = write_context_proposal(
+        judgment = run_drift_judge(
             filename=filename,
-            target_line_number=finding.line_number,
-            numbered_context_text=context.context_text,
-            contradiction_summary=finding.contradiction_summary,
-            suggested_update=finding.suggested_update,
+            hunk_diff_text=hunk_text,
+            current_project_concept=current_project_concept,
+            recent_worklog_summaries=recent_worklogs,
+        )
+    except EvaluatorError as exc:
+        print(f"    FEHLER beim Judge-Aufruf fuer diesen Hunk: {exc}")
+        return
+
+    print(f"    is_meaningful={judgment.is_meaningful}, is_supported={judgment.is_supported}, severity={judgment.severity}")
+    print(f"    Begruendung: {judgment.reasoning}")
+
+    if not judgment.is_meaningful:
+        print("    -> Trivial/nicht bedeutsam, wird uebersprungen.")
+        return
+
+    if judgment.is_supported:
+        print("    -> Kein Widerspruch zum Projektstand erkannt, wird uebersprungen.")
+        return
+
+    scored = score_judgment_heuristically(judgment)
+    print(f"    Score: {scored.weighted_score:.2f}, approved={scored.approved}")
+
+    if not scored.approved:
+        print(f"    Verworfen vom Evaluator: {scored.rejection_reason}")
+        return
+
+    try:
+        proposed_patch = write_patch(
+            filename=filename,
+            contradiction_summary=judgment.contradiction_summary,
+            hunk_diff_text=hunk_text,
             current_project_concept=current_project_concept,
             rejection_examples=rejection_examples,
         )
-    except ProposalWriterError as exc:
-        print(f"    FEHLER beim Erzeugen des Vorschlags fuer Zeile {finding.line_number}: {exc}")
+    except PatchWriterError as exc:
+        print(f"    FEHLER beim Erzeugen des Patches: {exc}")
         return
 
-    validation = validate_updated_context(context.context_text_plain, written.updated_context_text)
+    current_full_text = full_path.read_text(encoding="utf-8")
+    validation = validate_patch(proposed_patch, current_full_text)
+
     if not validation.passed:
-        print(f"    AUTOMATISCH VERWORFEN fuer Zeile {finding.line_number}:")
+        print("    AUTOMATISCH VERWORFEN (Patch-Validierung fehlgeschlagen):")
         for failure in validation.failures:
             print(f"      - {failure}")
         return
 
-    updated_full_text = replace_context_in_full_text(current_full_text, context, written.updated_context_text)
+    validated_patch = validation.validated_patch
 
-    print("\n" + "=" * 70)
-    print(f"VORSCHAU FUER: {filename}, Zeile {finding.line_number} (Kontext {context.context_start_line}-{context.context_end_line})")
-    print("=" * 70)
-    print(f"Aenderungs-Zusammenfassung: {written.change_summary}\n")
-
-    if not has_actual_changes(current_full_text, updated_full_text):
-        print("Kein tatsaechlicher Unterschied im vorgeschlagenen Text -- wird uebersprungen.")
+    result = apply_patch(current_full_text, validated_patch)
+    if not result.success:
+        print(f"    FEHLER bei der Patch-Anwendung: {result.error_message}")
         return
 
-    diff_text = build_unified_diff(current_full_text, updated_full_text, filename)
+    print("\n" + "=" * 70)
+    print(f"VORSCHAU FUER: {filename}")
+    print("=" * 70)
+    print(f"Aenderungs-Zusammenfassung: {validated_patch.change_summary}\n")
+
+    diff_text = build_unified_diff(current_full_text, result.updated_full_text, filename)
     print(diff_text)
     print()
 
-    answer = input(
-        f"Diese Aenderung an Zeile {finding.line_number} JETZT schreiben? (ja/nein): "
-    ).strip().lower()
+    answer = input("Diesen Patch JETZT schreiben? (ja/nein): ").strip().lower()
 
     if answer in ("ja", "j", "yes", "y"):
-        full_path.write_text(updated_full_text, encoding="utf-8")
+        full_path.write_text(result.updated_full_text, encoding="utf-8")
         print(f"-> Geschrieben: {full_path}")
     else:
         reason = input("Kurzer Grund fuer die Ablehnung (Pflichtfeld): ").strip()
@@ -150,9 +189,9 @@ def _handle_single_finding(
             rejection_history_root=REJECTION_HISTORY_ROOT,
             agent_name=AGENT_NAME,
             filename=filename,
-            contradiction_summary=finding.contradiction_summary,
-            suggested_update=finding.suggested_update,
-            proposed_text=written.updated_context_text,
+            contradiction_summary=judgment.contradiction_summary,
+            suggested_update=validated_patch.replacement_text,
+            proposed_text=validated_patch.replacement_text,
             rejection_reason=reason,
         )
         print("-> Abgelehnt. In Ablehnungs-Historie gespeichert fuer kuenftige Prompts.")
@@ -160,7 +199,7 @@ def _handle_single_finding(
 
 def run() -> None:
     print(f"Starte Curator+Evaluator-Durchlauf fuer Projekt: {TARGET_PROJECT_NAME}")
-    print("Schritt 1/6: Frischer concept_summary-Lauf (kann ca. 1 Minute dauern)...")
+    print("Schritt 1/5: Frischer concept_summary-Lauf (kann ca. 1 Minute dauern)...")
 
     try:
         current_summary = refresh_and_load(
@@ -175,7 +214,7 @@ def run() -> None:
     print(f"  -> {len(current_summary.document_summaries)} Dokument(e) zusammengefasst.")
     current_raw_texts = _read_current_raw_texts(current_summary.source_file_mtimes)
 
-    print("Schritt 2/6: Vorherigen Snapshot (inkl. Rohtext-Historie) laden...")
+    print("Schritt 2/5: Vorherigen Snapshot (inkl. Rohtext-Historie) laden...")
     previous_result = load_latest_snapshot_with_raw_texts(CURATOR_DATA_ROOT, TARGET_PROJECT_NAME)
     if previous_result is None:
         previous_summary, previous_raw_texts = None, {}
@@ -184,7 +223,7 @@ def run() -> None:
         previous_summary, previous_raw_texts = previous_result
         print(f"  -> Vorheriger Snapshot vom {previous_summary.generated_at} geladen.")
 
-    print("Schritt 3/6: Schicht 1 -- deterministischer mtime-Diff...")
+    print("Schritt 3/5: Schicht 1 -- deterministischer mtime-Diff...")
     diff_result = diff_concept_summaries(previous=previous_summary, current=current_summary)
     print(f"  -> {len(diff_result.candidates)} Kandidat(en) aus Schicht 1 (mtime veraendert/neu).")
 
@@ -198,96 +237,49 @@ def run() -> None:
         print("\nKeine Aenderungen seit letztem Snapshot erkannt. Snapshot aktualisiert. Fertig.")
         return
 
-    print("Schritt 4/6: Schicht 2 -- Rohtext-Embedding-Aehnlichkeits-Filter...")
-    try:
-        embedding_results = filter_candidates(
-            diff_result.candidates,
-            previous_raw_texts=previous_raw_texts,
-            current_raw_texts=current_raw_texts,
-        )
-    except Exception as exc:
-        print(f"ABBRUCH in Schicht 2 (Snapshot NICHT gespeichert): {exc}")
-        return
-
-    passed_candidates = [r.candidate for r in embedding_results if r.passed]
-
-    for r in embedding_results:
-        status = "WEITERGEREICHT" if r.passed else "VERWORFEN"
-        print(f"  - {r.candidate.filename}: {status} ({r.reason})")
-
-    if not passed_candidates:
-        save_snapshot(CURATOR_DATA_ROOT, TARGET_PROJECT_NAME, current_summary)
-        print("\nAlle Kandidaten von Schicht 2 verworfen. Snapshot aktualisiert. Fertig.")
-        return
-
-    print(f"\nSchritt 5/6: Schicht 3 -- LLM-Judge fuer {len(passed_candidates)} Kandidat(en)...")
-    all_findings_by_candidate: dict[str, list[DriftFinding]] = {}
-    any_judge_error = False
-
-    for candidate in passed_candidates:
-        print(f"\n  Pruefe: {candidate.filename} ...")
-        recent_worklogs = _recent_worklog_summaries(current_summary, candidate.filename)
-        full_text = current_raw_texts.get(candidate.filename, "")
-
-        try:
-            findings = run_drift_judge(
-                filename=candidate.filename,
-                full_document_text=full_text,
-                current_project_concept=current_summary.concept_text,
-                recent_worklog_summaries=recent_worklogs,
-            )
-        except EvaluatorError as exc:
-            print(f"    FEHLER beim Judge-Aufruf: {exc}")
-            any_judge_error = True
-            continue
-
-        print(f"    -> {len(findings)} Finding(s) gefunden.")
-        approved_findings = []
-        for finding in findings:
-            scored = score_finding_heuristically(finding)
-            print(f"\n    Zeile {finding.line_number} ({finding.severity}):")
-            print(f"      Begruendung: {finding.reasoning}")
-            print(f"      Widerspruch: {finding.contradiction_summary}")
-            print(f"      Vorschlag: {finding.suggested_update}")
-            print(f"      Score: {scored.weighted_score:.2f}, approved={scored.approved}")
-            if scored.approved:
-                approved_findings.append(finding)
-            else:
-                print(f"      Verworfen: {scored.rejection_reason}")
-
-        if approved_findings:
-            all_findings_by_candidate[candidate.filename] = approved_findings
-
-    if any_judge_error:
-        print("\nWARNUNG: Mindestens ein Judge-Aufruf ist fehlgeschlagen (Snapshot wird trotzdem gespeichert).")
-
-    save_snapshot(CURATOR_DATA_ROOT, TARGET_PROJECT_NAME, current_summary)
-
-    if not all_findings_by_candidate:
-        print("\nKeine freigegebenen Findings.")
-        return
-
-    print("\nSchritt 6/6: Fuer jedes Finding einzeln -- Kontext extrahieren, Human-in-the-Loop...")
+    print("Schritt 4/5: Deterministische Diff-Hunks pro geaenderter Datei berechnen...")
     rejections = load_rejections(REJECTION_HISTORY_ROOT, AGENT_NAME)
     rejection_examples = format_for_prompt(rejections)
 
-    for filename, findings in all_findings_by_candidate.items():
-        full_path = _full_path_for_filename(current_summary.source_file_mtimes, filename)
-        if full_path is None:
-            print(f"ABBRUCH fuer {filename}: Pfad nicht auffindbar.")
+    for candidate in diff_result.candidates:
+        if candidate.previous_summary is None:
+            print(f"\n{candidate.filename}: neues Dokument, kein Vorzustand fuer Hunk-Diff -- wird uebersprungen (Phase 1 fokussiert auf Aenderungserkennung, nicht Neuanlage-Bewertung).")
             continue
 
-        findings_desc = _findings_sorted_descending(findings)
-        print(f"\n{filename}: {len(findings_desc)} Finding(s) werden von unten nach oben verarbeitet.")
+        old_text = previous_raw_texts.get(candidate.filename)
+        new_text = current_raw_texts.get(candidate.filename)
 
-        for finding in findings_desc:
-            _handle_single_finding(
-                filename=filename,
+        if old_text is None or new_text is None:
+            print(f"\n{candidate.filename}: Rohtext-Historie fehlt, wird uebersprungen.")
+            continue
+
+        hunks = compute_diff_hunks(old_text, new_text)
+        print(f"\n{candidate.filename}: {len(hunks)} Aenderungsblock/-bloecke gefunden.")
+
+        if not hunks:
+            continue
+
+        full_path = _full_path_for_filename(current_summary.source_file_mtimes, candidate.filename)
+        if full_path is None:
+            print(f"  ABBRUCH: Pfad nicht auffindbar.")
+            continue
+
+        recent_worklogs = _recent_worklog_summaries(current_summary, candidate.filename)
+
+        for i, hunk in enumerate(hunks, start=1):
+            print(f"\n  Block {i}/{len(hunks)} (Zeilen {hunk.new_start_line}-{hunk.new_end_line}):")
+            _handle_hunk(
+                filename=candidate.filename,
                 full_path=full_path,
-                finding=finding,
+                hunk=hunk,
                 current_project_concept=current_summary.concept_text,
+                recent_worklogs=recent_worklogs,
                 rejection_examples=rejection_examples,
             )
+
+    print("\nSchritt 5/5: Snapshot aktualisieren...")
+    save_snapshot(CURATOR_DATA_ROOT, TARGET_PROJECT_NAME, current_summary)
+    print("Fertig.")
 
 
 if __name__ == "__main__":
