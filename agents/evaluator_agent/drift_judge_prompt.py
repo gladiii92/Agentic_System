@@ -1,25 +1,13 @@
 """
 agents/evaluator_agent/drift_judge_prompt.py
 
-VERSION 3 (2026-08-25, kompletter Architektur-Umbau -- siehe Chat-Verlauf,
-Recherche-Zusammenfassung "robuste Patch-Architektur"). Der Judge bewertet
-jetzt NICHT mehr die ganze Datei mit Zeilennummern (Version 2 fuehrte zu
-Uebergeneralisierung: 10 identische Fehlschluesse auf verschiedene Zeilen
-eines Merkposten-Abschnitts). Er bewertet stattdessen NUR NOCH die
-tatsaechlich vom Nutzer geaenderten Textstellen (DiffHunks aus
-diff_hunks.py) -- eine radikal kleinere, praezisere Aufgabe.
-
-WICHTIGE NEUE REGEL (siehe Chat-Verlauf, Ursache des letzten realen
-Fehlers): explizite Klarstellung, dass Abschnitte wie "Merkposten",
-"TODO", "Wiedervorlage", "Offene Punkte" bewusst offene Arbeitspunkte
-enthalten DUERFEN, auch wenn eine uebergeordnete Phase als abgeschlossen
-gilt -- das ist KEIN Widerspruch, sondern normale Dokumentationspraxis.
-
-Der Judge liefert jetzt PRO HUNK maximal EIN Urteil (nicht mehr eine
-offene Liste ueber das ganze Dokument) -- das begrenzt die Aufgabe auf
-das absolute Minimum und macht Uebergeneralisierung strukturell
-schwieriger, weil es schlicht nichts "Nachbarliches" gibt, auf das
-generalisiert werden koennte.
+VERSION 4 (2026-08-25, Severity-Kalibrierung -- siehe Chat-Verlauf: Judge
+stufte einen klar durch Worklogs belegten Widerspruch nur als LOW ein,
+was zu einem Score unter der Mindestschwelle fuehrte, obwohl die
+inhaltliche Analyse selbst korrekt und bestimmt war). Aenderung
+gegenueber Version 3: CONSTRAINTS enthaelt jetzt eine explizite
+Severity-Definition mit Ankerbeispielen, damit der Judge nicht mehr
+durchgehend zu LOW tendiert.
 """
 
 from __future__ import annotations
@@ -48,7 +36,13 @@ CONSTRAINTS = """Wichtige Einschränkungen:
 - WICHTIG: Wenn der Kontext auf einen Abschnitt wie "Merkposten", "TODO", "Wiedervorlage", "Offene Punkte", "Nächste Schritte" hindeutet, ist es NORMAL und KEIN Widerspruch, dass dort offene Aufgaben stehen -- auch wenn andernorts im Projekt eine übergeordnete Phase als abgeschlossen gilt. Melde das NICHT als is_supported=false.
 - "is_supported=false" bedeutet: der NEUE Text behauptet etwas, das der Projektstand/die Worklogs AKTIV UND KONKRET widerlegen (z.B. eine Phase als "Offen" bezeichnen, die laut Worklogs nachweislich fertig ist).
 - "is_meaningful=false" bedeutet: die Änderung ist trivial (Tippfehler, Formatierung, Synonym) und braucht keine weitere Aktion.
-- Wenn du unsicher bist, setze is_supported=true (im Zweifel NICHT als Widerspruch werten) und severity=LOW.
+
+SEVERITY-EINSTUFUNG (bitte genau befolgen, nicht durchgehend LOW wählen):
+- HIGH: Die Änderung behauptet einen GESAMTPROJEKTSTATUS (z.B. "alles fertig", "Projekt abgeschlossen"), der durch die Worklogs EINDEUTIG UND UMFASSEND widerlegt wird (mehrere offene Phasen laut Worklogs).
+- MEDIUM: Die Änderung behauptet den Status EINER EINZELNEN, KONKRET BENANNTEN Phase/Funktion, der durch die Worklogs eindeutig widerlegt wird.
+- LOW: Die Änderung ist zwar nicht ganz präzise, aber nur in einer Nuance falsch, oder die Worklogs liefern nur einen indirekten/schwachen Beleg.
+- Ein Widerspruch, den du selbst in deiner Begründung als "eindeutig durch die Worklogs belegt" beschreibst, ist NIEMALS LOW -- mindestens MEDIUM.
+- Wenn du unsicher bist, OB überhaupt ein Widerspruch besteht, setze is_supported=true. Wenn du dir SICHER bist, DASS ein Widerspruch besteht, aber unsicher über das genaue Ausmaß, wähle MEDIUM als Standardfall, nicht LOW.
 - Antworte ausschließlich mit validem JSON, kein Freitext davor oder danach."""
 
 OUTPUT_FORMAT = """Antworte ausschließlich mit einem JSON-Objekt exakt in dieser Struktur:
