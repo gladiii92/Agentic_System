@@ -72,7 +72,7 @@ MAX_FULL_DOCUMENT_CHARS = 20_000
 # Eskalations-Reihenfolge fuer den Patch-Writer. Ollama bewusst entfernt
 # (siehe Modul-Docstring) -- kann bei Bedarf wieder ergaenzt werden:
 # ("ollama", "gemini", "groq").
-PATCH_WRITER_MODEL_TIERS = ("gemini", "groq")
+PATCH_WRITER_MODEL_TIERS = ("groq")
 
 
 def _read_current_raw_texts(source_file_mtimes: dict[str, float]) -> dict[str, str]:

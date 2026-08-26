@@ -80,7 +80,7 @@ MAX_FULL_DOCUMENT_CHARS = 20_000
 # Identisch zu run_drift_check.py -- Ollama bewusst ausgeschlossen fuer
 # den Patch-Writer (siehe dortige Begruendung, empirisch belegte
 # Modell-Faehigkeitsgrenze bei dieser Lokalisierungsaufgabe).
-PATCH_WRITER_MODEL_TIERS = ("gemini", "groq")
+PATCH_WRITER_MODEL_TIERS = ("groq",)
 
 
 def _clip_document_text(text: str, max_chars: int = MAX_FULL_DOCUMENT_CHARS) -> str:
@@ -147,6 +147,7 @@ def _handle_chunk_finding(
     rejection_examples: list[str],
 ) -> None:
     current_full_text_for_judge = full_path.read_text(encoding="utf-8")
+    clipped_full_text = _clip_document_text(current_full_text_for_judge)
 
     try:
         judgment = run_drift_judge(
@@ -248,7 +249,6 @@ def run(target_filename: str) -> None:
 
     full_text = full_path.read_text(encoding="utf-8")
     other_summaries = _other_document_summaries(current_summary, target_filename)
-    clipped_full_text = _clip_document_text(full_text)
 
     print("Schritt 2/3: Dokument in Chunks aufteilen...")
     chunks = compute_document_chunks(full_text)
