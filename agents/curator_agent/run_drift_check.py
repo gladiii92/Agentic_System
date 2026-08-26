@@ -1,37 +1,20 @@
 """
 agents/curator_agent/run_drift_check.py
 
-VERSION 2026-08-26 -- VOLLKONTEXT-ERGAENZUNG (siehe Chat-Verlauf).
+VERSION 2026-08-26b -- PATCH-WRITER VOLLKONTEXT-ERGAENZUNG (siehe Chat-
+Verlauf). Aufbauend auf VERSION 2026-08-26 (Judge-Vollkontext-Fix).
 
-Aenderungen gegenueber der Version vom 2026-08-25:
+Aenderung gegenueber der Version 2026-08-26 (Vormittag):
+- _handle_hunk() reicht jetzt full_document_text auch an write_patch()
+  weiter (bisher nur an run_drift_judge()). Grund (realer Testfall
+  ROADMAP.md, 2026-08-26): der Patch-Writer kannte bisher nur den
+  kleinen Hunk und hat dadurch die FALSCHE Zeile korrigiert (die
+  Tabellenzeile zu Phase 8 verstuemmelt, statt sie korrekt zu berichtigen
+  oder den eigentlich falschen Satz zu aendern) -- siehe
+  patch_writer_prompt.py-Docstring fuer die volle Begruendung.
 
-1. _recent_worklog_summaries() -> UMBENANNT zu _other_document_summaries()
-   und GENERALISIERT: der bisherige Filter "worklog" in doc.path.lower()
-   war zu spezifisch fuer DIESES eine Testprojekt (AI_Project_Reviewer
-   mit Worklog-Dateien) und widerspricht dem generellen Ziel, beliebige
-   Projekte/Ordnerstrukturen ohne Sonderwissen ueber Dateinamen zu
-   unterstuetzen. Die neue Funktion sammelt die Ollama-Zusammenfassungen
-   ALLER anderen Dokumente im Projekt, unabhaengig vom Dateinamen.
-
-2. NEU: full_document_text wird pro Hunk mitgegeben -- der volle
-   aktuelle Text DERSELBEN Datei, aus der der Hunk stammt (Variable
-   new_text existierte bereits in run(), wird jetzt zusaetzlich an
-   _handle_hunk() durchgereicht). Grund: der Judge konnte bisher
-   Widersprueche INNERHALB derselben Datei nicht erkennen, wenn sie
-   ausserhalb des kleinen Hunk-Kontextfensters lagen (siehe Chat-Verlauf,
-   realer Testfall ROADMAP.md: Statustabelle vs. Fazit-Satz).
-
-3. NEU: _clip_document_text() als einfaches Sicherheitsnetz gegen sehr
-   lange Dokumente -- kuerzt full_document_text auf eine Obergrenze
-   (Zeichen, nicht Tokens -- grobe, aber ausreichende Naeherung fuer
-   dieses Sicherheitsnetz) und ergaenzt einen sichtbaren Kuerzungshinweis.
-   Echtes Chunking (Dokument in mehrere Abschnitte teilen, mehrfach an
-   den Judge geben) ist bewusst NICHT Teil dieser Aenderung -- separates,
-   spaeteres Thema, siehe Chat-Verlauf.
-
-Der uebrige Ablauf (Schritte 1-8) ist UNVERAENDERT gegenueber der
-Version vom 2026-08-25 -- siehe dortige Docstring-Beschreibung fuer die
-volle Architektur-Begruendung.
+Alle anderen Schritte (1-8) sind UNVERAENDERT gegenueber der Version vom
+2026-08-26 Vormittag.
 """
 
 from __future__ import annotations
@@ -94,8 +77,9 @@ def _full_path_for_filename(source_file_mtimes: dict[str, float], filename: str)
 
 def _other_document_summaries(current_summary, exclude_filename: str) -> str:
     """Sammelt die Ollama-Zusammenfassungen ALLER anderen Dokumente im
-    Projekt, unabhaengig vom Dateinamen (siehe Modul-Docstring Punkt 1
-    fuer die Begruendung der Generalisierung)."""
+    Projekt, unabhaengig vom Dateinamen (kein "worklog"-Filter mehr --
+    siehe Chat-Verlauf 2026-08-26 fuer die Begruendung der
+    Generalisierung)."""
     parts = []
     for doc in current_summary.document_summaries:
         if doc.path == exclude_filename:
@@ -105,9 +89,9 @@ def _other_document_summaries(current_summary, exclude_filename: str) -> str:
 
 
 def _clip_document_text(text: str, max_chars: int = MAX_FULL_DOCUMENT_CHARS) -> str:
-    """Einfaches Sicherheitsnetz gegen sehr lange Dokumente (siehe Modul-
-    Docstring Punkt 3). Kein Chunking, nur harte Kuerzung mit sichtbarem
-    Hinweis, damit der Judge weiss, dass der Text unvollstaendig ist."""
+    """Einfaches Sicherheitsnetz gegen sehr lange Dokumente. Kein
+    Chunking, nur harte Kuerzung mit sichtbarem Hinweis, damit Judge/
+    Patch-Writer wissen, dass der Text unvollstaendig ist."""
     if len(text) <= max_chars:
         return text
     return (
@@ -164,6 +148,7 @@ def _handle_hunk(
             contradiction_summary=judgment.contradiction_summary,
             hunk_diff_text=hunk_text,
             current_project_concept=current_project_concept,
+            full_document_text=clipped_full_text,
             rejection_examples=rejection_examples,
         )
     except PatchWriterError as exc:

@@ -1,10 +1,24 @@
 """
 agents/evaluator_agent/patch_writer.py
 
-NEUES Modul (2026-08-25, ersetzt proposal_writer.py komplett). Ruft den
-Patch-Writer-Prompt auf und liefert einen ProposedPatch (noch NICHT
-validiert -- siehe patching/patch_validator.py fuer den naechsten
-Pflichtschritt vor jeder Anzeige/Anwendung).
+VERSION 2 (2026-08-26, Vollkontext-Ergaenzung -- siehe Chat-Verlauf und
+patch_writer_prompt.py-Docstring fuer die volle Begruendung).
+
+Aenderung gegenueber der Version vom 2026-08-25:
+- write_patch() bekommt einen neuen Pflichtparameter full_document_text:
+  str -- der volle aktuelle Text derselben Datei. Wird durchgereicht an
+  build_patch_writer_prompt(), damit das Modell die tatsaechlich zu
+  korrigierende Stelle im GANZEN Dokument finden kann, nicht nur
+  innerhalb des kleinen Hunks.
+- Ollama-Request setzt jetzt explizit "num_ctx": 8192 (siehe evaluator.py
+  fuer dieselbe Begruendung -- verhindert lautloses Abschneiden des
+  laengeren Prompts durch Ollamas kleines Default-Kontextfenster).
+
+WICHTIG: die harte Sicherheitsschicht (patching/patch_validator.py)
+bleibt UNVERAENDERT und wird weiterhin auf JEDEN von hier zurueckgegebenen
+ProposedPatch angewendet, bevor irgendetwas angezeigt oder geschrieben
+wird -- dieser Vollkontext-Fix ersetzt NICHT die Validierung, er soll nur
+die Trefferquote plausibler Vorschlaege verbessern.
 """
 
 from __future__ import annotations
@@ -17,7 +31,8 @@ from agents.evaluator_agent.patch_writer_prompt import build_patch_writer_prompt
 from patching.patch_models import ProposedPatch
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_MODEL = "qwen2.5:latest"
+DEFAULT_MODEL = "qwen2.5-coder:latest"
+DEFAULT_NUM_CTX = 8192
 
 
 class PatchWriterError(Exception):
@@ -29,15 +44,18 @@ def write_patch(
     contradiction_summary: str,
     hunk_diff_text: str,
     current_project_concept: str,
+    full_document_text: str,
     rejection_examples: list[str] | None = None,
     model: str = DEFAULT_MODEL,
     timeout_seconds: int = 90,
+    num_ctx: int = DEFAULT_NUM_CTX,
 ) -> ProposedPatch:
     prompt = build_patch_writer_prompt(
         filename=filename,
         contradiction_summary=contradiction_summary,
         hunk_diff_text=hunk_diff_text,
         current_project_concept=current_project_concept,
+        full_document_text=full_document_text,
         rejection_examples=rejection_examples,
     )
 
@@ -48,7 +66,7 @@ def write_patch(
                 "model": model,
                 "prompt": prompt,
                 "format": "json",
-                "options": {"temperature": 0},
+                "options": {"temperature": 0, "num_ctx": num_ctx},
                 "stream": False,
             },
             timeout=timeout_seconds,
