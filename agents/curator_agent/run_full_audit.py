@@ -144,9 +144,10 @@ def _handle_chunk_finding(
     chunk_text: str,
     current_project_concept: str,
     other_document_summaries: str,
-    clipped_full_text: str,
     rejection_examples: list[str],
 ) -> None:
+    current_full_text_for_judge = full_path.read_text(encoding="utf-8")
+
     try:
         judgment = run_drift_judge(
             filename=filename,
@@ -173,7 +174,7 @@ def _handle_chunk_finding(
         print(f"    Verworfen vom Evaluator: {scored.rejection_reason}")
         return
 
-    current_full_text = full_path.read_text(encoding="utf-8")
+    current_full_text = current_full_text_for_judge
 
     validated_patch, successful_tier = _write_patch_with_escalation(
         filename=filename,
@@ -266,7 +267,6 @@ def run(target_filename: str) -> None:
             chunk_text=chunk_text,
             current_project_concept=current_summary.concept_text,
             other_document_summaries=other_summaries,
-            clipped_full_text=clipped_full_text,
             rejection_examples=rejection_examples,
         )
 
