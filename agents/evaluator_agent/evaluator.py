@@ -1,11 +1,25 @@
 """
 agents/evaluator_agent/evaluator.py
 
-VERSION 3 (2026-08-25, Hunk-basierter Umbau -- siehe Chat-Verlauf).
-run_drift_judge() bewertet jetzt EINEN einzelnen DiffHunk (aus
-diff_hunks.py) und liefert EIN Urteil zurueck (nicht mehr eine offene
-Liste von Findings ueber die ganze Datei -- Version 2 fuehrte zu
-Uebergeneralisierung, siehe drift_judge_prompt.py-Docstring).
+VERSION 4 (2026-08-26, Vollkontext-Ergaenzung -- siehe Chat-Verlauf und
+drift_judge_prompt.py-Docstring fuer die volle Begruendung).
+
+Aenderung gegenueber Version 3:
+- run_drift_judge() bekommt einen neuen Pflichtparameter
+  full_document_text: str -- der volle aktuelle Text derselben Datei,
+  aus der der bewertete Hunk stammt. Wird 1:1 an build_drift_judge_prompt()
+  durchgereicht.
+- Der Ollama-Request setzt jetzt explizit "num_ctx": 8192. Grund (siehe
+  Chat-Verlauf-Recherche): Ollama laedt Modelle ohne expliziten num_ctx
+  oft mit einem sehr kleinen Default-Kontextfenster (teils nur 2048-4096
+  Tokens), unabhaengig vom nativen Modell-Limit (qwen2.5-coder unterstuetzt
+  nativ 32K). Ohne diese explizite Angabe wuerde der neu hinzugefuegte
+  Volltext-Kontext bei laengeren Dokumenten lautlos abgeschnitten -- exakt
+  dasselbe Grundproblem wie beim urspruenglichen Bug, nur eine Ebene
+  tiefer. 8192 Tokens sind fuer die aktuelle Zielhardware (RTX 2070 Super,
+  8GB VRAM) sicher und reichen fuer Dokumente bis ca. 25.000-30.000
+  Zeichen -- fuer laengere Dokumente ist Chunking ein separates, noch
+  nicht umgesetztes Folgethema (siehe Chat-Verlauf).
 
 DEFAULT_MODEL bleibt qwen2.5-coder:latest (bewaehrt fuer die
 Analyse-Aufgabe, siehe Chat-Verlauf A/B-Test 2026-08-24).
@@ -22,6 +36,7 @@ from agents.evaluator_agent.drift_judge_prompt import build_drift_judge_prompt
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 DEFAULT_MODEL = "qwen2.5-coder:latest"
+DEFAULT_NUM_CTX = 8192
 
 
 class EvaluatorError(Exception):
@@ -42,16 +57,26 @@ def run_drift_judge(
     hunk_diff_text: str,
     current_project_concept: str,
     recent_worklog_summaries: str,
+    full_document_text: str,
     model: str = DEFAULT_MODEL,
     timeout_seconds: int = 90,
+    num_ctx: int = DEFAULT_NUM_CTX,
 ) -> HunkJudgment:
     """Bewertet EINEN Hunk. Wird von run_drift_check.py fuer JEDEN
-    DiffHunk einzeln aufgerufen."""
+    DiffHunk einzeln aufgerufen.
+
+    full_document_text: voller aktueller Text derselben Datei, aus der
+    der Hunk stammt -- reine Referenz fuer den Judge, damit Widersprueche
+    INNERHALB desselben Dokuments (z.B. Statustabelle vs. Fazit-Satz)
+    erkennbar werden, auch wenn sie ausserhalb des kleinen
+    Hunk-Kontextfensters liegen.
+    """
     prompt = build_drift_judge_prompt(
         filename=filename,
         hunk_diff_text=hunk_diff_text,
         current_project_concept=current_project_concept,
         recent_worklog_summaries=recent_worklog_summaries,
+        full_document_text=full_document_text,
     )
 
     try:
@@ -61,7 +86,7 @@ def run_drift_judge(
                 "model": model,
                 "prompt": prompt,
                 "format": "json",
-                "options": {"temperature": 0},
+                "options": {"temperature": 0, "num_ctx": num_ctx},
                 "stream": False,
             },
             timeout=timeout_seconds,

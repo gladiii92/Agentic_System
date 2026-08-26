@@ -1,39 +1,37 @@
 """
 agents/curator_agent/run_drift_check.py
 
-VERSION 2026-08-25 -- KOMPLETTER ARCHITEKTUR-UMBAU (siehe Chat-Verlauf,
-Recherche-Zusammenfassung "robuste Patch-Architektur" nach mehreren
-gescheiterten Freitext-Schreibversuchen).
+VERSION 2026-08-26 -- VOLLKONTEXT-ERGAENZUNG (siehe Chat-Verlauf).
 
-NEUER, ROBUSTER ABLAUF:
-    1. Frischer concept_summary-Lauf (concept_loader.py, unveraendert)
-    2. Vorherigen Snapshot INKL. Rohtext-Historie laden (snapshot_store.py,
-       unveraendert)
-    3. Schicht 1 -- deterministischer mtime-Diff (drift_diff.py, unveraendert)
-       -- entscheidet NUR, ob sich ueberhaupt eine Datei geaendert hat.
-    4. NEU -- diff_hunks.py: deterministischer Zeilen-Diff zwischen altem
-       und neuem Rohtext DERSELBEN Datei. Liefert PRAEZISE Aenderungs-
-       bloecke, OHNE jeden Rate-/Embedding-Schritt.
-    5. Fuer JEDEN Hunk: Judge bewertet NUR diesen einen Hunk (is_meaningful,
-       is_supported). Triviale/neutrale Hunks werden SOFORT verworfen,
-       OHNE Scoring, OHNE Schreibversuch.
-    6. Fuer jeden als "nicht belegt" (echter Widerspruch) bewerteten Hunk:
-       Scoring (bewaehrtes 4-Kriterien-Schema), dann Patch-Writer erzeugt
-       EXAKTES exact_old_text/replacement_text-Paar (patch_writer.py).
-    7. patch_validator.py: harte, deterministische Pruefung (exact_old_text
-       muss GENAU EINMAL im Dokument vorkommen, Laengenverhaeltnis, keine
-       Prompt-Leak-Marker). NUR bestandene Patches werden angezeigt.
-    8. Human-in-the-Loop pro Patch, Anwendung via patch_applier.py
-       (reine, sichere String-Ersetzung).
+Aenderungen gegenueber der Version vom 2026-08-25:
 
-ENTFERNTE MODULE (siehe Chat-Verlauf, koennen geloescht werden):
-    - section_locator.py (Abschnitts-Lokalisierung per Wortueberlappung)
-    - embedding_filter.py (Embedding-Aehnlichkeit als Vorfilter)
-    - line_context_extractor.py (Zeilennummer-Kontext-Ausschnitt)
-    - proposal_writer.py / proposal_writer_prompt.py (Freitext-Schreiben)
-    - proposal_validation.py (schwaechere Laengen-/Marker-Validierung)
-    Begruendung jeweils: durch den deterministischen Diff-Hunk +
-    exact-match-Patch-Ansatz vollstaendig und robuster ersetzt.
+1. _recent_worklog_summaries() -> UMBENANNT zu _other_document_summaries()
+   und GENERALISIERT: der bisherige Filter "worklog" in doc.path.lower()
+   war zu spezifisch fuer DIESES eine Testprojekt (AI_Project_Reviewer
+   mit Worklog-Dateien) und widerspricht dem generellen Ziel, beliebige
+   Projekte/Ordnerstrukturen ohne Sonderwissen ueber Dateinamen zu
+   unterstuetzen. Die neue Funktion sammelt die Ollama-Zusammenfassungen
+   ALLER anderen Dokumente im Projekt, unabhaengig vom Dateinamen.
+
+2. NEU: full_document_text wird pro Hunk mitgegeben -- der volle
+   aktuelle Text DERSELBEN Datei, aus der der Hunk stammt (Variable
+   new_text existierte bereits in run(), wird jetzt zusaetzlich an
+   _handle_hunk() durchgereicht). Grund: der Judge konnte bisher
+   Widersprueche INNERHALB derselben Datei nicht erkennen, wenn sie
+   ausserhalb des kleinen Hunk-Kontextfensters lagen (siehe Chat-Verlauf,
+   realer Testfall ROADMAP.md: Statustabelle vs. Fazit-Satz).
+
+3. NEU: _clip_document_text() als einfaches Sicherheitsnetz gegen sehr
+   lange Dokumente -- kuerzt full_document_text auf eine Obergrenze
+   (Zeichen, nicht Tokens -- grobe, aber ausreichende Naeherung fuer
+   dieses Sicherheitsnetz) und ergaenzt einen sichtbaren Kuerzungshinweis.
+   Echtes Chunking (Dokument in mehrere Abschnitte teilen, mehrfach an
+   den Judge geben) ist bewusst NICHT Teil dieser Aenderung -- separates,
+   spaeteres Thema, siehe Chat-Verlauf.
+
+Der uebrige Ablauf (Schritte 1-8) ist UNVERAENDERT gegenueber der
+Version vom 2026-08-25 -- siehe dortige Docstring-Beschreibung fuer die
+volle Architektur-Begruendung.
 """
 
 from __future__ import annotations
@@ -71,6 +69,10 @@ REJECTION_HISTORY_ROOT = Path(r"G:\DAVID\Desktop\GitHub\Agentic_System\data\reje
 TARGET_PROJECT_NAME = "AI_Project_Reviewer"
 AGENT_NAME = "curator_agent"
 
+# Sicherheitsnetz gegen sehr lange Dokumente im Vollkontext-Prompt (siehe
+# evaluator.py DEFAULT_NUM_CTX-Kommentar fuer die Kontextfenster-Begruendung).
+MAX_FULL_DOCUMENT_CHARS = 20_000
+
 
 def _read_current_raw_texts(source_file_mtimes: dict[str, float]) -> dict[str, str]:
     raw_texts: dict[str, str] = {}
@@ -90,14 +92,28 @@ def _full_path_for_filename(source_file_mtimes: dict[str, float], filename: str)
     return None
 
 
-def _recent_worklog_summaries(current_summary, exclude_filename: str) -> str:
+def _other_document_summaries(current_summary, exclude_filename: str) -> str:
+    """Sammelt die Ollama-Zusammenfassungen ALLER anderen Dokumente im
+    Projekt, unabhaengig vom Dateinamen (siehe Modul-Docstring Punkt 1
+    fuer die Begruendung der Generalisierung)."""
     parts = []
     for doc in current_summary.document_summaries:
         if doc.path == exclude_filename:
             continue
-        if "worklog" in doc.path.lower():
-            parts.append(f"- {doc.path}: {doc.summary}")
+        parts.append(f"- {doc.path}: {doc.summary}")
     return "\n".join(parts)
+
+
+def _clip_document_text(text: str, max_chars: int = MAX_FULL_DOCUMENT_CHARS) -> str:
+    """Einfaches Sicherheitsnetz gegen sehr lange Dokumente (siehe Modul-
+    Docstring Punkt 3). Kein Chunking, nur harte Kuerzung mit sichtbarem
+    Hinweis, damit der Judge weiss, dass der Text unvollstaendig ist."""
+    if len(text) <= max_chars:
+        return text
+    return (
+        text[:max_chars]
+        + f"\n\n[... Dokument gekuerzt, {len(text) - max_chars} weitere Zeichen nicht angezeigt ...]"
+    )
 
 
 def _handle_hunk(
@@ -105,38 +121,41 @@ def _handle_hunk(
     full_path: Path,
     hunk,
     current_project_concept: str,
-    recent_worklogs: str,
+    other_document_summaries: str,
+    full_document_text: str,
     rejection_examples: list[str],
 ) -> None:
     hunk_text = render_hunk_for_prompt(hunk)
+    clipped_full_text = _clip_document_text(full_document_text)
 
     try:
         judgment = run_drift_judge(
             filename=filename,
             hunk_diff_text=hunk_text,
             current_project_concept=current_project_concept,
-            recent_worklog_summaries=recent_worklogs,
+            recent_worklog_summaries=other_document_summaries,
+            full_document_text=clipped_full_text,
         )
     except EvaluatorError as exc:
-        print(f"    FEHLER beim Judge-Aufruf fuer diesen Hunk: {exc}")
+        print(f"  FEHLER beim Judge-Aufruf fuer diesen Hunk: {exc}")
         return
 
-    print(f"    is_meaningful={judgment.is_meaningful}, is_supported={judgment.is_supported}, severity={judgment.severity}")
-    print(f"    Begruendung: {judgment.reasoning}")
+    print(f"  is_meaningful={judgment.is_meaningful}, is_supported={judgment.is_supported}, severity={judgment.severity}")
+    print(f"  Begruendung: {judgment.reasoning}")
 
     if not judgment.is_meaningful:
-        print("    -> Trivial/nicht bedeutsam, wird uebersprungen.")
+        print("  -> Trivial/nicht bedeutsam, wird uebersprungen.")
         return
 
     if judgment.is_supported:
-        print("    -> Kein Widerspruch zum Projektstand erkannt, wird uebersprungen.")
+        print("  -> Kein Widerspruch zum Projektstand erkannt, wird uebersprungen.")
         return
 
     scored = score_judgment_heuristically(judgment)
-    print(f"    Score: {scored.weighted_score:.2f}, approved={scored.approved}")
+    print(f"  Score: {scored.weighted_score:.2f}, approved={scored.approved}")
 
     if not scored.approved:
-        print(f"    Verworfen vom Evaluator: {scored.rejection_reason}")
+        print(f"  Verworfen vom Evaluator: {scored.rejection_reason}")
         return
 
     try:
@@ -148,23 +167,23 @@ def _handle_hunk(
             rejection_examples=rejection_examples,
         )
     except PatchWriterError as exc:
-        print(f"    FEHLER beim Erzeugen des Patches: {exc}")
+        print(f"  FEHLER beim Erzeugen des Patches: {exc}")
         return
 
     current_full_text = full_path.read_text(encoding="utf-8")
     validation = validate_patch(proposed_patch, current_full_text)
 
     if not validation.passed:
-        print("    AUTOMATISCH VERWORFEN (Patch-Validierung fehlgeschlagen):")
+        print("  AUTOMATISCH VERWORFEN (Patch-Validierung fehlgeschlagen):")
         for failure in validation.failures:
-            print(f"      - {failure}")
+            print(f"    - {failure}")
         return
 
     validated_patch = validation.validated_patch
 
     result = apply_patch(current_full_text, validated_patch)
     if not result.success:
-        print(f"    FEHLER bei der Patch-Anwendung: {result.error_message}")
+        print(f"  FEHLER bei der Patch-Anwendung: {result.error_message}")
         return
 
     print("\n" + "=" * 70)
@@ -261,10 +280,10 @@ def run() -> None:
 
         full_path = _full_path_for_filename(current_summary.source_file_mtimes, candidate.filename)
         if full_path is None:
-            print(f"  ABBRUCH: Pfad nicht auffindbar.")
+            print("  ABBRUCH: Pfad nicht auffindbar.")
             continue
 
-        recent_worklogs = _recent_worklog_summaries(current_summary, candidate.filename)
+        other_summaries = _other_document_summaries(current_summary, candidate.filename)
 
         for i, hunk in enumerate(hunks, start=1):
             print(f"\n  Block {i}/{len(hunks)} (Zeilen {hunk.new_start_line}-{hunk.new_end_line}):")
@@ -273,7 +292,8 @@ def run() -> None:
                 full_path=full_path,
                 hunk=hunk,
                 current_project_concept=current_summary.concept_text,
-                recent_worklogs=recent_worklogs,
+                other_document_summaries=other_summaries,
+                full_document_text=new_text,
                 rejection_examples=rejection_examples,
             )
 
