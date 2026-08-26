@@ -1,27 +1,29 @@
 """
 agents/curator_agent/run_drift_check.py
 
-VERSION 2026-08-26c -- CLOUD-ESKALATION (siehe Chat-Verlauf und
-model_clients.py-Docstring fuer die volle Begruendung).
+VERSION 2026-08-26d -- OLLAMA FUER PATCH-WRITER UEBERSPRUNGEN (siehe
+Chat-Verlauf).
 
-Aenderung gegenueber Version 2026-08-26b (Patch-Writer Vollkontext-Fix):
-1. load_dotenv() wird jetzt einmalig beim Modul-Import aufgerufen, damit
-   GEMINI_API_KEY/GROQ_API_KEY aus der .env-Datei im Projektroot in
-   os.environ verfuegbar sind (vorher nirgends im Projekt aufgerufen).
-2. _handle_hunk() versucht write_patch() jetzt in einer Eskalations-
-   schleife: zuerst "ollama" (qwen2.5-coder:latest), bei fehlgeschlagener
-   Validierung (validate_patch().passed=False) "gemini", danach bei
-   erneutem Fehlschlag "groq". Human-in-the-Loop bleibt bei JEDER Stufe
-   unveraendert bestehen -- KEINE Stufe schreibt automatisch, jede
-   Stufe liefert nur einen Patch-VORSCHLAG, der erst nach bestandener
-   Validierung UND "ja"-Bestaetigung tatsaechlich geschrieben wird.
-3. Scheitert auch die letzte Stufe (Groq) an der Validierung, wird das
-   wie bisher als vollstaendig verworfen behandelt und im Terminal klar
-   protokolliert, WELCHE Stufen versucht wurden und woran sie jeweils
-   scheiterten.
+Aenderung gegenueber Version 2026-08-26c (Cloud-Eskalation eingebaut):
+PATCH_WRITER_MODEL_TIERS wurde von ("ollama", "gemini", "groq") auf
+("gemini", "groq") reduziert. Grund: der lokale Patch-Writer (sowohl
+qwen2.5:latest als auch qwen2.5-coder:latest, mit UND ohne die
+"Standardregel Hunk-Zeile ist Korrekturziel"-Praezisierung im Prompt)
+hat in FUENF aufeinanderfolgenden realen Testlaeufen reproduzierbar die
+FALSCHE von zwei aehnlichen Zeilen im Dokument getroffen. Das ist kein
+Kontext-/Prompt-Problem mehr (im Unterschied zum Judge, der nach dem
+Vollkontext-Fix zuverlaessig funktioniert), sondern eine empirisch
+belegte Modell-Faehigkeitsgrenze fuer diese spezifische
+Lokalisierungs-/Formulierungsaufgabe. Ollama bleibt fuer den JUDGE
+weiterhin die einzige Stufe (dort besteht kein belegter Bedarf fuer
+Eskalation) -- betrifft NUR PATCH_WRITER_MODEL_TIERS.
+
+Ollama kann bei Bedarf jederzeit wieder ergaenzt werden, indem
+PATCH_WRITER_MODEL_TIERS auf ("ollama", "gemini", "groq") zurueckgesetzt
+wird -- keine sonstige Codeaenderung noetig.
 
 Alle anderen Schritte sind UNVERAENDERT gegenueber der Version vom
-2026-08-26 (Vormittag/Nachmittag).
+2026-08-26 (Cloud-Eskalation, load_dotenv()).
 """
 
 from __future__ import annotations
@@ -67,9 +69,10 @@ AGENT_NAME = "curator_agent"
 # evaluator.py DEFAULT_NUM_CTX-Kommentar fuer die Kontextfenster-Begruendung).
 MAX_FULL_DOCUMENT_CHARS = 20_000
 
-# Eskalations-Reihenfolge fuer den Patch-Writer (siehe model_clients.py
-# fuer die Begruendung der Anbieter-Auswahl und Reihenfolge).
-PATCH_WRITER_MODEL_TIERS = ("ollama", "gemini", "groq")
+# Eskalations-Reihenfolge fuer den Patch-Writer. Ollama bewusst entfernt
+# (siehe Modul-Docstring) -- kann bei Bedarf wieder ergaenzt werden:
+# ("ollama", "gemini", "groq").
+PATCH_WRITER_MODEL_TIERS = ("gemini", "groq")
 
 
 def _read_current_raw_texts(source_file_mtimes: dict[str, float]) -> dict[str, str]:
@@ -208,7 +211,7 @@ def _handle_hunk(
     )
 
     if validated_patch is None:
-        print("  AUTOMATISCH VERWORFEN: alle Stufen (ollama, gemini, groq) sind an der Patch-Validierung gescheitert.")
+        print(f"  AUTOMATISCH VERWORFEN: alle Stufen {PATCH_WRITER_MODEL_TIERS} sind an der Patch-Validierung gescheitert.")
         return
 
     result = apply_patch(current_full_text, validated_patch)

@@ -1,29 +1,28 @@
 """
 agents/evaluator_agent/patch_writer_prompt.py
 
-VERSION 2 (2026-08-26, Vollkontext-Ergaenzung -- siehe Chat-Verlauf).
+VERSION 3 (2026-08-26, Standardregel "Hunk-Zeile ist Korrekturziel" --
+siehe Chat-Verlauf).
 
-Aenderung gegenueber der Version vom 2026-08-25: TASK_TEMPLATE bekommt
-einen neuen Platzhalter {full_document_text} und die Aufgabenstellung
-wurde umformuliert. Grund (realer Testfall ROADMAP.md, 2026-08-26):
+Aenderung gegenueber Version 2 (Vollkontext-Ergaenzung, selbes Datum):
+Version 2 erlaubte dem Modell, JEDE Stelle im Volltext als Korrekturziel
+zu waehlen, ohne Praeferenz. In mehreren realen Testlaeufen (ROADMAP.md,
+Phase-3-Status-Widerspruch) fuehrte das reproduzierbar dazu, dass das
+Modell eine ANDERE, thematisch aehnliche Zeile (z.B. ein separates
+"Status:"-Feld an anderer Stelle im Dokument) aenderte, statt die im
+Hunk selbst gezeigte Zeile zu korrigieren -- obwohl GENAU DIESE Zeile
+die vom Nutzer bewusst herbeigefuehrte, fehlerhafte Aenderung war.
 
-Die alte Version wies das Modell an, exact_old_text ZWINGEND aus den
-"+"-Zeilen DES HUNKS zu waehlen. Der Hunk zeigte nur den Satz "Alle
-Phasen sind abgeschlossen UND das Projekt ist FERTIG!" -- die Zeile, die
-den WIDERSPRUCH dazu enthaelt (Tabellenzeile "Phase 8 ... Offen ...
-Phase 8 wurde am 2026-08-24 abgeschlossen"), stand an einer ANDEREN
-Stelle im Dokument, ausserhalb des Hunks. Das Modell hat sich REGELKONFORM
-verhalten (exact_old_text kam wortwoertlich aus dem Hunk), aber die Regel
-selbst zwang es auf die falsche Zielzeile -- es hat die Tabellenzeile
-verstuemmelt, weil es nicht wusste, dass DAS die eigentlich fehlerhafte
-Stelle war, sondern nur den kontradiktorischen Satz kannte.
-
-NEU: das Modell bekommt jetzt den vollen aktuellen Dokumenttext und darf
-exact_old_text aus JEDER Stelle im Dokument waehlen, die tatsaechlich zum
-Widerspruch gehoert -- nicht mehr zwingend aus dem Hunk selbst. Der Hunk
-bleibt der Ausloeser/Beleg fuer den Widerspruch, aber die zu korrigierende
-Stelle kann auch anderswo im Dokument liegen (z.B. eine veraltete
-Tabellenzeile, die dem neuen Satz widerspricht).
+Kernproblem (siehe Chat-Verlauf): der Hunk zeigt die Aenderung, aber der
+Prompt gab keine klare Regel, WANN der Hunk selbst das Korrekturziel ist
+und wann eine andere Stelle. Neue Standardregel: der Hunk ist im
+Regelfall SELBST das Korrekturziel (die im Hunk gezeigte Aenderung wird
+auf einen durch den Volltext belegten korrekten Wert zurueckgesetzt).
+Nur wenn der Widerspruch AUSDRUECKLICH nicht im Hunk selbst liegt,
+sondern in einem SEPARATEN Satz, der durch die Hunk-Aenderung neu falsch
+geworden ist (z.B. ein zusammenfassender Fazit-Satz, der durch die neue
+Formulierung der Hunk-Zeile widersprochen wird), darf eine andere Stelle
+gewaehlt werden.
 """
 
 from __future__ import annotations
@@ -40,13 +39,16 @@ Widerspruch: {contradiction_summary}
 Die Änderung, die diesen Widerspruch AUSGELÖST hat (- = alter Text, + = aktuell im Dokument stehender Text, ohne Präfix = unveränderter Kontext):
 {hunk_diff_text}
 
-Vollständiger aktueller Text der Datei (durchsuche diesen Text, um die tatsächlich zu korrigierende Stelle zu finden -- das kann die oben gezeigte Änderung selbst sein, ODER eine ANDERE Stelle im Dokument, die dem neuen Text widerspricht, z.B. eine veraltete Tabellenzeile):
+Vollständiger aktueller Text der Datei (NUR zur Orientierung -- um zu entscheiden, welcher Wert in der Hunk-Zeile korrekt ist, und um im Ausnahmefall eine andere betroffene Stelle zu finden):
 {full_document_text}
 
 Tatsächlicher, aktueller Gesamtprojektstand (zur Orientierung):
 {current_project_concept}
 
-Identifiziere den EXAKTEN, wortwörtlichen Textausschnitt aus dem vollständigen Dokumenttext oben, der korrigiert werden muss, damit der Widerspruch behoben ist, und liefere einen präzisen Ersatztext dafür. Wähle dabei GENAU DIE Stelle, die tatsächlich fachlich falsch ist -- das ist nicht automatisch die oben gezeigte Änderung selbst, sondern kann auch die Stelle sein, der die Änderung widerspricht."""
+STANDARDREGEL (befolge diese, außer der Ausnahmefall unten trifft klar zu):
+Die zu korrigierende Stelle ist im Regelfall GENAU die oben im Hunk gezeigte "+"-Zeile selbst -- nicht eine andere, thematisch ähnliche Zeile irgendwo sonst im Dokument. Deine Aufgabe ist normalerweise: setze den Wert in DIESER Zeile auf den durch den vollständigen Dokumenttext belegten, korrekten Stand zurück (z.B. wenn die Hunk-Zeile "Abgeschlossen" behauptet, aber der Rest des Dokuments eindeutig zeigt, dass es noch offen ist, korrigiere GENAU DIESE Zeile zurück auf den korrekten Status).
+
+AUSNAHMEFALL: Wähle NUR dann eine ANDERE Stelle als Korrekturziel, wenn der Widerspruch nachweislich NICHT in der Hunk-Zeile selbst liegt, sondern in einem separaten Satz an anderer Stelle im Dokument, der durch die neue Formulierung der Hunk-Zeile widersprüchlich geworden ist (z.B. ein übergeordneter Fazit-/Zusammenfassungssatz, der durch die Hunk-Änderung falsch wurde, während die Hunk-Zeile selbst unverändert korrekt bleiben soll)."""
 
 CONSTRAINTS_TEMPLATE = """Wichtige Einschränkungen:
 - exact_old_text MUSS ein WORTWÖRTLICHES, ZEICHENGENAUES Zitat aus dem vollständigen Dokumenttext oben sein -- keine Paraphrase, keine Korrektur von Tippfehlern im Original, exakt wie dort geschrieben (inklusive Leerzeichen, Satzzeichen, Zeilenumbrüche).
@@ -56,6 +58,7 @@ CONSTRAINTS_TEMPLATE = """Wichtige Einschränkungen:
 - Ändere KEINE Formatierung (Sprache, Wortwahl in Nachbarsätzen, Tabellensyntax), die nicht Teil des Widerspruchs ist.
 - Falls ein Status bereits "Abgeschlossen" war, darf er NIE rückwärts auf "Offen" gesetzt werden.
 - Lösche KEINE Information ohne Ersatz (z.B. keine Tabellenspalte einfach leeren) -- wenn eine Spalte/Zeile falsch ist, korrigiere ihren Inhalt, statt ihn zu entfernen.
+- Bevor du eine ANDERE Zeile als die Hunk-Zeile wählst: pruefe nochmal, ob die Standardregel oben nicht doch zutrifft. Im Zweifel gilt die Standardregel (Hunk-Zeile korrigieren), nicht der Ausnahmefall.
 {rejection_examples_block}"""
 
 OUTPUT_FORMAT = """Antworte ausschließlich mit einem JSON-Objekt exakt in dieser Struktur:

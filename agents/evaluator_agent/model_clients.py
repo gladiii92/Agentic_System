@@ -45,8 +45,8 @@ GEMINI_URL_TEMPLATE = (
 )
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-DEFAULT_GEMINI_MODEL = "gemini-2.5-pro"
-DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 
 
 class ModelClientError(Exception):
