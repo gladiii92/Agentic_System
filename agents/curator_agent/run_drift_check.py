@@ -1,25 +1,36 @@
 """
 agents/curator_agent/run_drift_check.py
 
-VERSION 2026-08-26b -- PATCH-WRITER VOLLKONTEXT-ERGAENZUNG (siehe Chat-
-Verlauf). Aufbauend auf VERSION 2026-08-26 (Judge-Vollkontext-Fix).
+VERSION 2026-08-26c -- CLOUD-ESKALATION (siehe Chat-Verlauf und
+model_clients.py-Docstring fuer die volle Begruendung).
 
-Aenderung gegenueber der Version 2026-08-26 (Vormittag):
-- _handle_hunk() reicht jetzt full_document_text auch an write_patch()
-  weiter (bisher nur an run_drift_judge()). Grund (realer Testfall
-  ROADMAP.md, 2026-08-26): der Patch-Writer kannte bisher nur den
-  kleinen Hunk und hat dadurch die FALSCHE Zeile korrigiert (die
-  Tabellenzeile zu Phase 8 verstuemmelt, statt sie korrekt zu berichtigen
-  oder den eigentlich falschen Satz zu aendern) -- siehe
-  patch_writer_prompt.py-Docstring fuer die volle Begruendung.
+Aenderung gegenueber Version 2026-08-26b (Patch-Writer Vollkontext-Fix):
+1. load_dotenv() wird jetzt einmalig beim Modul-Import aufgerufen, damit
+   GEMINI_API_KEY/GROQ_API_KEY aus der .env-Datei im Projektroot in
+   os.environ verfuegbar sind (vorher nirgends im Projekt aufgerufen).
+2. _handle_hunk() versucht write_patch() jetzt in einer Eskalations-
+   schleife: zuerst "ollama" (qwen2.5-coder:latest), bei fehlgeschlagener
+   Validierung (validate_patch().passed=False) "gemini", danach bei
+   erneutem Fehlschlag "groq". Human-in-the-Loop bleibt bei JEDER Stufe
+   unveraendert bestehen -- KEINE Stufe schreibt automatisch, jede
+   Stufe liefert nur einen Patch-VORSCHLAG, der erst nach bestandener
+   Validierung UND "ja"-Bestaetigung tatsaechlich geschrieben wird.
+3. Scheitert auch die letzte Stufe (Groq) an der Validierung, wird das
+   wie bisher als vollstaendig verworfen behandelt und im Terminal klar
+   protokolliert, WELCHE Stufen versucht wurden und woran sie jeweils
+   scheiterten.
 
-Alle anderen Schritte (1-8) sind UNVERAENDERT gegenueber der Version vom
-2026-08-26 Vormittag.
+Alle anderen Schritte sind UNVERAENDERT gegenueber der Version vom
+2026-08-26 (Vormittag/Nachmittag).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from agents.curator_agent.concept_loader import (
     ConceptSummaryLoadError,
@@ -56,6 +67,10 @@ AGENT_NAME = "curator_agent"
 # evaluator.py DEFAULT_NUM_CTX-Kommentar fuer die Kontextfenster-Begruendung).
 MAX_FULL_DOCUMENT_CHARS = 20_000
 
+# Eskalations-Reihenfolge fuer den Patch-Writer (siehe model_clients.py
+# fuer die Begruendung der Anbieter-Auswahl und Reihenfolge).
+PATCH_WRITER_MODEL_TIERS = ("ollama", "gemini", "groq")
+
 
 def _read_current_raw_texts(source_file_mtimes: dict[str, float]) -> dict[str, str]:
     raw_texts: dict[str, str] = {}
@@ -77,9 +92,7 @@ def _full_path_for_filename(source_file_mtimes: dict[str, float], filename: str)
 
 def _other_document_summaries(current_summary, exclude_filename: str) -> str:
     """Sammelt die Ollama-Zusammenfassungen ALLER anderen Dokumente im
-    Projekt, unabhaengig vom Dateinamen (kein "worklog"-Filter mehr --
-    siehe Chat-Verlauf 2026-08-26 fuer die Begruendung der
-    Generalisierung)."""
+    Projekt, unabhaengig vom Dateinamen."""
     parts = []
     for doc in current_summary.document_summaries:
         if doc.path == exclude_filename:
@@ -90,14 +103,54 @@ def _other_document_summaries(current_summary, exclude_filename: str) -> str:
 
 def _clip_document_text(text: str, max_chars: int = MAX_FULL_DOCUMENT_CHARS) -> str:
     """Einfaches Sicherheitsnetz gegen sehr lange Dokumente. Kein
-    Chunking, nur harte Kuerzung mit sichtbarem Hinweis, damit Judge/
-    Patch-Writer wissen, dass der Text unvollstaendig ist."""
+    Chunking, nur harte Kuerzung mit sichtbarem Hinweis."""
     if len(text) <= max_chars:
         return text
     return (
         text[:max_chars]
         + f"\n\n[... Dokument gekuerzt, {len(text) - max_chars} weitere Zeichen nicht angezeigt ...]"
     )
+
+
+def _write_patch_with_escalation(
+    filename: str,
+    contradiction_summary: str,
+    hunk_text: str,
+    current_project_concept: str,
+    clipped_full_text: str,
+    rejection_examples: list[str],
+    current_full_text: str,
+):
+    """Versucht write_patch() + validate_patch() nacheinander fuer jede
+    Stufe in PATCH_WRITER_MODEL_TIERS. Gibt (validated_patch, tier)
+    zurueck bei Erfolg, sonst (None, None) nach Ausschoepfen aller
+    Stufen. Jede Stufe wird protokolliert."""
+    for tier in PATCH_WRITER_MODEL_TIERS:
+        print(f"  Patch-Writer-Versuch (Stufe: {tier})...")
+        try:
+            proposed_patch = write_patch(
+                filename=filename,
+                contradiction_summary=contradiction_summary,
+                hunk_diff_text=hunk_text,
+                current_project_concept=current_project_concept,
+                full_document_text=clipped_full_text,
+                rejection_examples=rejection_examples,
+                model_tier=tier,
+            )
+        except PatchWriterError as exc:
+            print(f"    FEHLER bei Stufe '{tier}': {exc}")
+            continue
+
+        validation = validate_patch(proposed_patch, current_full_text)
+        if validation.passed:
+            print(f"    -> Stufe '{tier}' hat einen validen Patch geliefert.")
+            return validation.validated_patch, tier
+
+        print(f"    Stufe '{tier}': Patch-Validierung fehlgeschlagen:")
+        for failure in validation.failures:
+            print(f"      - {failure}")
+
+    return None, None
 
 
 def _handle_hunk(
@@ -142,29 +195,21 @@ def _handle_hunk(
         print(f"  Verworfen vom Evaluator: {scored.rejection_reason}")
         return
 
-    try:
-        proposed_patch = write_patch(
-            filename=filename,
-            contradiction_summary=judgment.contradiction_summary,
-            hunk_diff_text=hunk_text,
-            current_project_concept=current_project_concept,
-            full_document_text=clipped_full_text,
-            rejection_examples=rejection_examples,
-        )
-    except PatchWriterError as exc:
-        print(f"  FEHLER beim Erzeugen des Patches: {exc}")
-        return
-
     current_full_text = full_path.read_text(encoding="utf-8")
-    validation = validate_patch(proposed_patch, current_full_text)
 
-    if not validation.passed:
-        print("  AUTOMATISCH VERWORFEN (Patch-Validierung fehlgeschlagen):")
-        for failure in validation.failures:
-            print(f"    - {failure}")
+    validated_patch, successful_tier = _write_patch_with_escalation(
+        filename=filename,
+        contradiction_summary=judgment.contradiction_summary,
+        hunk_text=hunk_text,
+        current_project_concept=current_project_concept,
+        clipped_full_text=clipped_full_text,
+        rejection_examples=rejection_examples,
+        current_full_text=current_full_text,
+    )
+
+    if validated_patch is None:
+        print("  AUTOMATISCH VERWORFEN: alle Stufen (ollama, gemini, groq) sind an der Patch-Validierung gescheitert.")
         return
-
-    validated_patch = validation.validated_patch
 
     result = apply_patch(current_full_text, validated_patch)
     if not result.success:
@@ -172,7 +217,7 @@ def _handle_hunk(
         return
 
     print("\n" + "=" * 70)
-    print(f"VORSCHAU FUER: {filename}")
+    print(f"VORSCHAU FUER: {filename} (erzeugt von Stufe: {successful_tier})")
     print("=" * 70)
     print(f"Aenderungs-Zusammenfassung: {validated_patch.change_summary}\n")
 
