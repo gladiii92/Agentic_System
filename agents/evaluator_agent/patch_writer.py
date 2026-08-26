@@ -32,7 +32,7 @@ OLLAMA_URL = "http://localhost:11434/api/generate"
 DEFAULT_MODEL = "qwen2.5-coder:latest"
 DEFAULT_NUM_CTX = 8192
 
-VALID_MODEL_TIERS = ("ollama", "gemini", "groq")
+VALID_MODEL_TIERS = ("ollama", "groq", "gemini")
 
 
 class PatchWriterError(Exception):
