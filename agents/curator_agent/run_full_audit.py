@@ -125,8 +125,12 @@ def _write_patch_with_escalation(
                 model_tier=tier,
             )
         except PatchWriterError as exc:
-            print(f"      FEHLER bei Stufe '{tier}': {exc}")
+            print(f"    FEHLER bei Stufe '{tier}': {exc}")
             continue
+
+        print(f"    [DEBUG] exact_old_text (Stufe '{tier}'): {proposed_patch.exact_old_text!r}")
+        print(f"    [DEBUG] replacement_text (Stufe '{tier}'): {proposed_patch.replacement_text!r}")
+        print(f"    [DEBUG] change_summary (Stufe '{tier}'): {proposed_patch.change_summary!r}")
 
         validation = validate_patch(proposed_patch, current_full_text)
         if validation.passed:
@@ -150,6 +154,9 @@ def _handle_chunk_finding(
 ) -> None:
     current_full_text_for_judge = full_path.read_text(encoding="utf-8")
     clipped_full_text = _clip_document_text(current_full_text_for_judge)
+
+    print(f"    [DEBUG] chunk_text an Judge ({len(chunk_text)} Zeichen): {chunk_text[:300]!r}{'...' if len(chunk_text) > 300 else ''}")
+    print(f"    [DEBUG] full_document_text an Judge: {len(clipped_full_text)} Zeichen (gekuerzt: {len(clipped_full_text) < len(current_full_text_for_judge)})")
 
     try:
         judgment = run_drift_judge(
