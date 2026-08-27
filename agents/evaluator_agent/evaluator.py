@@ -122,6 +122,48 @@ def run_drift_judge(
         ) from exc
 
 
+def run_full_audit_judge(
+    filename: str,
+    document_section_to_evaluate: str,
+    current_project_concept: str,
+    recent_worklog_summaries: str,
+    full_document_text: str,
+    model: str = DEFAULT_MODEL,
+    num_ctx: int = DEFAULT_NUM_CTX,
+) -> HunkJudgment:
+    """
+    Bewertet einen Dokumentabschnitt auf interne Konsistenz (Full-Audit).
+    
+    Im Gegensatz zu run_drift_judge() (bewertet eine lokale Änderung) sucht
+    diese Funktion aktiv nach Widersprüchen innerhalb des Abschnitts oder
+    zwischen Abschnitt und Volltext.
+    """
+    from agents.evaluator_agent.full_audit_judge_prompt import build_full_audit_judge_prompt
+    
+    prompt = build_full_audit_judge_prompt(
+        filename=filename,
+        document_section_to_evaluate=document_section_to_evaluate,
+        current_project_concept=current_project_concept,
+        recent_worklog_summaries=recent_worklog_summaries,
+        full_document_text=full_document_text,
+    )
+    
+    try:
+        response = call_ollama(prompt=prompt, model=model, format_json=True, num_ctx=num_ctx)
+    except (OllamaConnectionError, OllamaTimeoutError, OllamaResponseError) as exc:
+        raise EvaluatorError(f"Ollama-Fehler beim Full-Audit-Judge: {exc}") from exc
+    
+    try:
+        return HunkJudgment(
+            is_meaningful=response.parsed_json["is_meaningful"],
+            is_supported=response.parsed_json["is_supported"],
+            severity=response.parsed_json["severity"],
+            reasoning=response.parsed_json["reasoning"],
+            contradiction_summary=response.parsed_json.get("contradiction_summary", ""),
+        )
+    except (KeyError, TypeError) as exc:
+        raise EvaluatorError(f"Ungültige JSON-Antwort vom Full-Audit-Judge: {exc}. Rohantwort: {response.raw_text[:500]}") from exc
+
 # ---------------------------------------------------------------------------
 # Vier-Kriterien-Scoring-Schema (unveraendert seit 2026-08-22, bewaehrt)
 # ---------------------------------------------------------------------------

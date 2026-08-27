@@ -60,8 +60,10 @@ from agents.curator_agent.diff_presenter import build_unified_diff
 from agents.evaluator_agent.evaluator import (
     EvaluatorError,
     run_drift_judge,
+    run_full_audit_judge,
     score_judgment_heuristically,
 )
+from agents.evaluator_agent.full_audit_judge_prompt import build_full_audit_judge_prompt
 from agents.evaluator_agent.patch_writer import PatchWriterError, write_patch
 from agents.evaluator_agent.rejection_history import (
     format_for_prompt,
@@ -159,9 +161,13 @@ def _handle_chunk_finding(
     print(f"    [DEBUG] full_document_text an Judge: {len(clipped_full_text)} Zeichen (gekuerzt: {len(clipped_full_text) < len(current_full_text_for_judge)})")
 
     try:
-        judgment = run_drift_judge(
+        # Full-Audit verwendet speziellen Prompt für Konsistenzprüfung (kein Hunk-Diff)
+        from agents.evaluator_agent.full_audit_judge_prompt import build_full_audit_judge_prompt
+        from agents.evaluator_agent.evaluator import run_full_audit_judge
+        
+        judgment = run_full_audit_judge(
             filename=filename,
-            hunk_diff_text=chunk_text,
+            document_section_to_evaluate=chunk_text,
             current_project_concept=current_project_concept,
             recent_worklog_summaries=other_document_summaries,
             full_document_text=clipped_full_text,
