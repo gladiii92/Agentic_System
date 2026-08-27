@@ -49,6 +49,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import time
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -269,6 +271,9 @@ def run(target_filename: str) -> None:
             other_document_summaries=other_summaries,
             rejection_examples=rejection_examples,
         )
+        if chunk.chunk_index < len(chunks) - 1:
+            print("  (Pause 15s, um Groq-Rate-Limit (TPM) nicht zu ueberschreiten...)")
+            time.sleep(15)
 
     print("\nFull-Audit abgeschlossen.")
 
