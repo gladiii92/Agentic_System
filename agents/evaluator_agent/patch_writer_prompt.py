@@ -58,6 +58,21 @@ CONSTRAINTS_TEMPLATE = """Wichtige Einschränkungen:
 - Ändere KEINE Formatierung (Sprache, Wortwahl in Nachbarsätzen, Tabellensyntax), die nicht Teil des Widerspruchs ist.
 - Falls ein Status bereits "Abgeschlossen" war, darf er NIE rückwärts auf "Offen" gesetzt werden.
 - Lösche KEINE Information ohne Ersatz (z.B. keine Tabellenspalte einfach leeren) -- wenn eine Spalte/Zeile falsch ist, korrigiere ihren Inhalt, statt ihn zu entfernen.
+
+KORREKTURRICHTUNG -- DATUMS-RANGFOLGE (wichtigste Regel, bitte genau befolgen):
+- Stehen zwei widersprüchliche Aussagen im Konflikt und trägt eine davon ein konkretes
+  Datum (z.B. "Abgeschlossen (2026-08-24)", "Alle Phasen ... (25.08.2026)"), so ist die
+  Aussage mit dem NEUEREN Datum die belegte Wahrheit.
+- Korrigiere die ÄLTERE (oder undatierte) widersprechende Aussage so, dass sie zur NEUEREN
+  Aussage passt. Ändere NIEMALS die neuere, bereits korrekte Aussage, um sie an die ältere
+  anzupassen.
+- Wenn die neuere Aussage den Status "Abgeschlossen" (oder "Abgeschlossen und real
+  verifiziert") angibt, korrigiere ältere/undatierte "Offen"/"Nächster Schritt"-Angaben
+  für dieselbe Phase dorthin -- niemals umgekehrt.
+- Im Zweifel: die neueste datierte Aussage (typischerweise die GESAMTAUSSAGE oder die
+  TABELLE mit dem jüngsten Stand) ist maßgeblich; die anderen Stellen werden an sie
+  angeglichen.
+
 - Bevor du eine ANDERE Zeile als die Hunk-Zeile wählst: pruefe nochmal, ob die Standardregel oben nicht doch zutrifft. Im Zweifel gilt die Standardregel (Hunk-Zeile korrigieren), nicht der Ausnahmefall.
 {rejection_examples_block}"""
 

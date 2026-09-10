@@ -37,6 +37,8 @@ Transport-/Antwort-Parsing-Code unterscheidet sich je Anbieter.
 from __future__ import annotations
 
 import os
+import re
+import time
 
 import requests
 
@@ -95,9 +97,17 @@ def call_groq(
     prompt: str,
     model: str = DEFAULT_GROQ_MODEL,
     timeout_seconds: int = 90,
+    max_retries_on_429: int = 1,
 ) -> str:
     """Ruft die Groq API auf (OpenAI-kompatibles Format) und gibt den
-    rohen Antworttext zurueck."""
+    rohen Antworttext zurueck.
+
+    Bei HTTP 429 (Rate Limit) wird EINMALIG die vom Server mitgeteilte
+    Retry-After-Zeit (bzw. die im Fehlertext genannte Sekundenzahl) abgewartet
+    und der Request wiederholt. Danach wird ein ModelClientError geworfen --
+    bewusst kein endloser Backoff, damit der Audit bei wiederholten Limits
+    sauber abbrechen statt haengen bleibt.
+    """
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
         raise ModelClientError("GROQ_API_KEY nicht in Umgebungsvariablen gefunden (.env pruefen).")
@@ -110,21 +120,50 @@ def call_groq(
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    try:
-        response = requests.post(GROQ_URL, json=payload, headers=headers, timeout=timeout_seconds)
-        response.raise_for_status()
-    except requests.exceptions.Timeout as exc:
-        raise ModelClientError(f"Groq Timeout nach {timeout_seconds}s.") from exc
-    except requests.exceptions.HTTPError as exc:
-        raise ModelClientError(f"Groq HTTP-Fehler: {exc}\nAntwort: {response.text[:500]}") from exc
-    except requests.exceptions.RequestException as exc:
-        raise ModelClientError(f"Groq nicht erreichbar: {exc}") from exc
+    retries = 0
+    while True:
+        try:
+            response = requests.post(GROQ_URL, json=payload, headers=headers, timeout=timeout_seconds)
+            if response.status_code == 429 and retries < max_retries_on_429:
+                retries += 1
+                wait_seconds = _groq_retry_after(response)
+                print(
+                    f"  Groq 429 (Rate-Limit) erkannt -- warte {wait_seconds:.0f}s "
+                    f"und wiederhole (Versuch {retries}/{max_retries_on_429})..."
+                )
+                time.sleep(wait_seconds)
+                continue
+            response.raise_for_status()
+        except requests.exceptions.Timeout as exc:
+            raise ModelClientError(f"Groq Timeout nach {timeout_seconds}s.") from exc
+        except requests.exceptions.HTTPError as exc:
+            raise ModelClientError(f"Groq HTTP-Fehler: {exc}\nAntwort: {response.text[:500]}") from exc
+        except requests.exceptions.RequestException as exc:
+            raise ModelClientError(f"Groq nicht erreichbar: {exc}") from exc
 
-    body = response.json()
+        body = response.json()
 
-    try:
-        return body["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as exc:
-        raise ModelClientError(
-            f"Groq-Antwort hat unerwartete Struktur: {exc}.\nRohantwort: {str(body)[:500]}"
-        ) from exc
+        try:
+            return body["choices"][0]["message"]["content"]
+        except (KeyError, IndexError) as exc:
+            raise ModelClientError(
+                f"Groq-Antwort hat unerwartete Struktur: {exc}.\nRohantwort: {str(body)[:500]}"
+            ) from exc
+
+
+def _groq_retry_after(response) -> float:
+    """Ermittelt die Wartezeit fuer einen 429-Retry:
+    1. HTTP-Header 'Retry-After' (in Sekunden),
+    2. sonst aus der Fehlermeldung 'try again in <n>s' (Groq-Format),
+    3. sonst Standard 30s.
+    """
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return float(retry_after)
+        except ValueError:
+            pass
+    m = re.search(r"try again in\s+([\d.]+)\s*s", response.text or "", re.IGNORECASE)
+    if m:
+        return float(m.group(1)) + 2.0  # kleine Reserve
+    return 30.0

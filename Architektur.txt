@@ -1,0 +1,42 @@
+Agentic_System/
+│
+├── agents/
+│   │
+│   ├── curator_agent/
+│   │   ├── concept_loader.py
+│   │   ├── snapshot_store.py
+│   │   ├── drift_diff.py
+│   │   ├── diff_presenter.py
+│   │   ├── run_drift_check.py
+│   │   └── run_full_audit.py
+│   │
+│   └── evaluator_agent/
+│       ├── evaluator.py
+│       ├── drift_judge_prompt.py
+│       ├── patch_writer.py
+│       ├── patch_writer_prompt.py
+│       ├── model_clients.py
+│       └── rejection_history.py
+│
+├── patching/
+│   ├── diff_hunks.py
+│   ├── document_chunker.py
+│   ├── patch_models.py
+│   ├── patch_validator.py
+│   └── patch_applier.py
+│
+├── data/
+│   ├── curator_snapshots/
+│   │   └── <project_name>/
+│   │       ├── concept_summary_XY_json
+│   │       └── latest.json
+│   │
+│   └── rejection_history/
+│       └── curator_agent.jsonl
+│
+├── Ablauf.txt
+├── Architektur.txt
+├── config.py
+├── requirements.txt
+├── .env
+└── .gitignore

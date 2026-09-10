@@ -14,7 +14,7 @@ werden kann.
 
 ## 0. Projektkontext (Kurzfassung, unveraendert gueltig)
 
-Der Nutzer (David, Lichtenfels/Bayern, DE) betreibt mehrere parallele
+Der Nutzer (David) betreibt mehrere parallele
 Software-/Business-Projekte und baut "Agentic_System" als kleine,
 selbst orchestrierte Multi-Agenten-Software-Firma: der Nutzer selbst
 als Ideengeber, spezialisierte KI-Agenten als ausfuehrende Kraft.

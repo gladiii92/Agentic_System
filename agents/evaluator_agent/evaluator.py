@@ -125,9 +125,6 @@ def run_drift_judge(
 def run_full_audit_judge(
     filename: str,
     document_section_to_evaluate: str,
-    current_project_concept: str,
-    recent_worklog_summaries: str,
-    full_document_text: str,
     model: str = DEFAULT_MODEL,
     num_ctx: int = DEFAULT_NUM_CTX,
 ) -> HunkJudgment:
@@ -143,26 +140,50 @@ def run_full_audit_judge(
     prompt = build_full_audit_judge_prompt(
         filename=filename,
         document_section_to_evaluate=document_section_to_evaluate,
-        current_project_concept=current_project_concept,
-        recent_worklog_summaries=recent_worklog_summaries,
-        full_document_text=full_document_text,
     )
     
+    timeout_seconds = 90
     try:
-        response = call_ollama(prompt=prompt, model=model, format_json=True, num_ctx=num_ctx)
-    except (OllamaConnectionError, OllamaTimeoutError, OllamaResponseError) as exc:
-        raise EvaluatorError(f"Ollama-Fehler beim Full-Audit-Judge: {exc}") from exc
-    
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": model,
+                "prompt": prompt,
+                "format": "json",
+                "options": {"temperature": 0, "num_ctx": num_ctx},
+                "stream": False,
+            },
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+    except requests.exceptions.ConnectionError as exc:
+        raise EvaluatorError("Ollama nicht erreichbar unter localhost:11434.") from exc
+    except requests.exceptions.Timeout as exc:
+        raise EvaluatorError(f"Ollama Timeout nach {timeout_seconds}s fuer {filename}.") from exc
+    except requests.exceptions.HTTPError as exc:
+        raise EvaluatorError(f"Ollama HTTP-Fehler fuer {filename}: {exc}") from exc
+
+    raw_text = response.json().get("response", "")
+
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise EvaluatorError(
+            f"Ollama-Antwort fuer {filename} ist kein valides JSON:\n{raw_text[:500]}"
+        ) from exc
+
     try:
         return HunkJudgment(
-            is_meaningful=response.parsed_json["is_meaningful"],
-            is_supported=response.parsed_json["is_supported"],
-            severity=response.parsed_json["severity"],
-            reasoning=response.parsed_json["reasoning"],
-            contradiction_summary=response.parsed_json.get("contradiction_summary", ""),
+            is_meaningful=bool(parsed["is_meaningful"]),
+            is_supported=bool(parsed["is_supported"]),
+            severity=parsed["severity"],
+            reasoning=parsed["reasoning"],
+            contradiction_summary=parsed.get("contradiction_summary", ""),
         )
-    except (KeyError, TypeError) as exc:
-        raise EvaluatorError(f"Ungültige JSON-Antwort vom Full-Audit-Judge: {exc}. Rohantwort: {response.raw_text[:500]}") from exc
+    except KeyError as exc:
+        raise EvaluatorError(
+            f"Ollama-Antwort fuer {filename} fehlt erwartetes Feld: {exc}.\nRohantwort: {raw_text[:500]}"
+        ) from exc
 
 # ---------------------------------------------------------------------------
 # Vier-Kriterien-Scoring-Schema (unveraendert seit 2026-08-22, bewaehrt)

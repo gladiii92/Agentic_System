@@ -1,69 +1,97 @@
 """
 agents/evaluator_agent/full_audit_judge_prompt.py
 
-NEU (2026-08-27): Spezial-Prompt für Full-Audit-Prüfungen.
-
-Im Gegensatz zu drift_judge_prompt.py (bewertet eine lokale Änderung auf
-Belegtheit) bewertet dieser Prompt einen gesamten Dokumentabschnitt auf
-INTERNE KONSISTENZ -- sucht aktiv nach Widersprüchen zwischen verschiedenen
-Teilen des Abschnitts ODER zwischen Abschnitt und Volltext.
-
-Verwendung: run_full_audit.py übergibt chunk_text als document_section_to_evaluate
-(kein hunk_diff_text), und dieser Prompt wird verwendet statt drift_judge_prompt.py.
+Spezifischer Prompt für den Full-Audit-Modus. Sucht aktiv nach Widersprüchen
+ausschließlich INNERHALB des gesamten Dokumenten-Chunks.
 """
 
 from __future__ import annotations
-
 from dataclasses import dataclass
 
-ROLE = """Du bist ein erfahrener Technical Writer und Projektmanager. Du prüfst einen Dokumentabschnitt auf INTERNE KONSISTENZ -- du suchst aktiv nach Widersprüchen zwischen verschiedenen Teilen des Abschnitts ODER zwischen Abschnitt und Volltext."""
+ROLE = """Du bist ein erfahrener Technical Writer und Projektmanager. Dies ist ein Full-Audit, kein Diff-Review. Deine Aufgabe ist es, einen vorgegebenen Dokumentabschnitt (Chunk) aktiv auf inhaltliche Inkonsistenzen und Widersprüche ZU SICH SELBST zu prüfen."""
 
-TASK_TEMPLATE = """Folgender Dokumentabschnitt wird auf Konsistenz geprüft:
+TASK_TEMPLATE = """Zu prüfender Dokumentabschnitt (Chunk) aus der Datei {filename}:
 
-Dateiname: {filename}
-
-Dokumentabschnitt (zu prüfender Ausschnitt):
 {document_section_to_evaluate}
 
-Vollständiger aktueller Text derselben Datei (Referenz für abteilungsübergreifende Widersprüche):
-{full_document_text}
-
-Tatsächlicher, aktueller Gesamtprojektstand (aus frischem Code-/Vault-Scan):
-{current_project_concept}
-
-Zusätzlicher Kontext -- Zusammenfassungen anderer Dokumente im selben Projekt:
-{recent_worklog_summaries}
-
-Aufgabe: Prüfe diesen Dokumentabschnitt explizit auf Widersprüche:
-1. Gibt es Widersprüche INNERHALB des Abschnitts (z.B. Tabelle sagt "Phase 3: Offen", Text sagt "Phase 3 ist abgeschlossen")?
-2. Gibt es Widersprüche ZWISCHEN Abschnitt und Volltext (z.B. Abschnitt sagt "Phase 8: Abgeschlossen", andere Stelle im Volltext sagt "Phase 8: Offen")?
-3. Gibt es Widersprüche zwischen Dokument und Projektstand (z.B. Dokument sagt "Phase 7: Abgeschlossen", Worklogs sagen "Phase 7: In Arbeit")?
-
-Melde JEDE gefundene Inkonsistenz als is_supported=false, auch wenn keine lokale Änderung vorliegt."""
+Aufgabe: 
+1. Gibt es innerhalb des gelieferten Chunks einen konkreten logischen Widerspruch?
+2. Gibt es widersprüchliche aktive Statusangaben innerhalb des Chunks?
+3. Gibt es eine explizite Aussage innerhalb des Chunks, die einer anderen expliziten Aussage desselben Chunks widerspricht?
+"""
 
 CONSTRAINTS = """Wichtige Einschränkungen:
-- Suche AKTIV nach Widersprüchen -- bewerte nicht nur, ob der Text "belegt" ist.
-- Eine fehlende oder unvollständige "Status:"/"Erreicht:"-Angabe INNERHALB des Abschnitts einer einzelnen Phase/Funktion ist für sich allein KEIN Beleg dafür, dass ein an anderer Stelle (z.B. einer Gesamtstatus-Tabelle) genannter Status FALSCH ist. Fehlende Binnendokumentation ist eine Dokumentationslücke, kein inhaltlicher Widerspruch. Setze in diesem Fall is_supported=true UND ergänze im Feld "reasoning" den Hinweis, dass die Binnendokumentation dieser Phase unvollständig ist -- aber melde es NICHT als is_supported=false, solange keine AKTIV widersprechende Aussage (z.B. eine andere Tabelle mit einem anderen Status) vorliegt.
-- Eine knappe Status-Angabe in einer Gesamtstatus-Tabelle (z.B. "Abgeschlossen (2026-08-24)" ohne Auflistung der einzelnen umgesetzten Punkte) ist KEIN Widerspruch zu einem detaillierteren "Erreicht:"-Block im Phasenabschnitt oder zu einem zusammenfassenden Satz im Dokument -- die Tabelle dient der Übersicht, der "Erreicht:"-Block der Detailnachweise. Setze is_supported=true, wenn der Tabellenstatus mit dem Phasenstatus oder dem zusammenfassenden Satz übereinstimmt, auch wenn die Tabelle weniger Details nennt.
-- Unterschiedliche Datumsangaben (z.B. "Abgeschlossen (2026-08-24)" in der Tabelle vs. "Alle Phasen bis Phase 8 sind abgeschlossen (25.08.2026)" im Fazit) sind KEIN Widerspruch, solange der STATUS-WERT (z.B. "Abgeschlossen") identisch ist. Das Datum kann sich durch spätere Präzisierung ändern, der Status bleibt gleich. Setze in diesem Fall is_supported=true.
-- ABER: Wenn der STATUS-WERT selbst widersprüchlich ist (z.B. Tabelle sagt "Phase 3: Nächster Schritt", Fazit sagt "Alle Phasen bis Phase 8 sind abgeschlossen"), ist das ein ECHTER Widerspruch -- setze is_supported=false, severity=MEDIUM/HIGH.
-- "is_supported=false" bedeutet: der Dokumentabschnitt oder der Volltext enthält eine Aussage, die einer anderen Aussage im selben Dokument, dem Projektstand oder den anderen Dokumenten AKTIV UND KONKRET widerspricht.
-- "is_meaningful=false" bedeutet: der Abschnitt enthält keine bewertbaren Aussagen (z.B. nur Formatierung, leere Zeilen, reine Überschriften ohne Inhalt).
-- Antworte ausschließlich mit validem JSON, kein Freitext davor oder danach."""
+- Bewerte AUSSCHLIESSLICH den Text innerhalb dieses Chunks.
+- Ein Widerspruch muss durch zwei konkrete Textstellen im Chunk belegbar sein.
 
-SEVERITY_GUIDANCE = """SEVERITY-EINSTUFUNG (bitte genau befolgen):
-- HIGH: Der Abschnitt enthält einen GESAMTPROJEKTSTATUS (z.B. "alles fertig", "Projekt abgeschlossen"), der durch den Rest des Dokuments, die Worklogs oder andere Dokumente EINDEUTIG UND UMFASSEND widerlegt wird (mehrere offene Phasen).
-- MEDIUM: Der Abschnitt enthält den Status EINER EINZELNEN, KONKRET BENANNTEN Phase/Funktion, der eindeutig widerlegt wird.
-- LOW: Der Abschnitt enthält eine Nuance, die nicht ganz präzise ist, aber nur schwach belegt widerlegt wird, oder die Belege sind nur indirekt."""
+REGEL 0 -- GLEICHE HIERARCHIE-STUFE = KEIN WIDERSPRUCH:
+- "Abgeschlossen" und "Abgeschlossen und real verifiziert" stehen auf derselben
+  (höchsten) Stufe: die zweite Form ist nur präziser. Das ist NIEMALS ein
+  Widerspruch. Setze is_supported=true.
+- "Offen" und "Nächster Schritt" stehen ebenfalls in derselben Bedeutungsklasse
+  ("noch nicht abgeschlossen") -- auch das ist KEIN Widerspruch.
+- Beachte dies als ERSTES und bevor du irgendeinen Widerspruch meldest.
+
+VERGLEICHE NUR INNERHALB DERSELBEN PHASE:
+- Ein Widerspruch liegt nur vor, wenn sich zwei Aussagen auf DIESELBE Phase
+  (gleiche Phasennummer) beziehen und dabei einen unterschiedlichen Gesamtstatus
+  behaupten (z.B. dieselbe Phase einmal als "abgeschlossen" und einmal als "offen").
+- Status-Angaben VERSCHIEDENER Phasen (z.B. Phase 2.5 vs. Phase 8) sind NIEMALS
+  ein Widerspruch zueinander -- auch nicht wenn sie sich in der Genauigkeit
+  unterscheiden.
+
+DATUMS-RANGFOLGE (zweitwichtigste Regel, bitte genau befolgen):
+- Enthält eine Aussage ein konkretes Datum, z.B. in Klammern "(2026-08-24)",
+  "(25.08.2026)" oder den Zusatz "(Stand: JJJJ-MM-TT)", so ist die Aussage mit dem
+  NEUESTEN Datum die maßgebliche Quelle der Wahrheit.
+- Steht eine ältere datierte oder undatierte Aussage im Widerspruch zur neuesten
+  datierten Aussage, so ist das ein ECHTER Widerspruch (is_supported=false) -- die
+  ältere/undatierte Aussage muss an die neueste datierte angeglichen werden.
+
+STATUS-HIERARCHIE:
+- Die Statuswerte sind wie folgt geordnet:
+  offen < nächster Schritt < in arbeit < abgeschlossen < abgeschlossen und real verifiziert
+- Zwei Aussagen auf derselben Hierarchie-Stufe (z.B. "Abgeschlossen" vs.
+  "Abgeschlossen und real verifiziert") sind KEIN Widerspruch -- die zweite ist nur
+  präziser. Setze is_supported=true.
+- Ein echter Widerspruch liegt vor, wenn Aussagen auf VERSCHIEDENEN Stufen stehen und
+  sich widersprechen (z.B. "Offen" vs. "Abgeschlossen" für dieselbe Phase).
+- "Offen" und "Nächster Schritt" sind KEIN Widerspruch zueinander (beide = noch
+  nicht abgeschlossen). Setze is_supported=true.
+
+KEINE WIDERSPRÜCHE:
+- Ein offener Punkt / Merkposten / TODO / "Offen: ..." ist NORMAL und KEIN Widerspruch,
+  auch wenn eine übergeordnete Phase als abgeschlossen gilt. Setze is_supported=true.
+- Eine knappe Status-Angabe in einer Tabelle (z.B. "Abgeschlossen (2026-08-24)") ist
+  KEIN Widerspruch zu einem detaillierteren "Erreicht:"-Block im Phasenabschnitt,
+  wenn der Status-Wert auf derselben Hierarchie-Stufe liegt.
+- Setze einen Status NIEMALS rückwärts von "Abgeschlossen"/"Abgeschlossen und real
+  verifiziert" auf "Offen"/"Nächster Schritt", außer eine NEUERE datierte Aussage im
+  selben Chunk belegt das ausdrücklich.
+- Unterschiedliche Datumsformate (z.B. "25.08." vs "2026-08-25") sind KEIN Widerspruch, wenn das Datum semantisch identisch ist. Unterschiedliche ECHTE Daten sind dagegen relevant für die Datums-Rangfolge oben.
+- Unterschiedliche Formulierungen/Synonyme sind KEIN Widerspruch, wenn sie dieselbe Aussage bedeuten.
+- Fehlende Informationen oder unvollständige Abschnitte sind KEIN Widerspruch.
+- Vermutungen sind KEIN Widerspruch.
+- "is_supported=false" bedeutet: Es GIBT einen aktiven, belegbaren Widerspruch im Chunk.
+- "is_supported=true" bedeutet: Es gibt KEINEN aktiven Widerspruch im Chunk.
+- "is_meaningful=true" bedeutet: Der Chunk enthält inhaltlich relevante Aussagen, die geprüft wurden. Setze bei echten Widersprüchen (is_supported=false) auch is_meaningful=true.
+
+SEVERITY-EINSTUFUNG (bitte genau befolgen):
+- HIGH: Widerspruch betrifft den Gesamtstatus bzw. den Abschlussstatus des Projekts oder widerspricht einer zentralen Gesamtstatus-Aussage.
+- MEDIUM: Widerspruch betrifft eine einzelne Phase, Funktion oder einen konkreten Projektbestandteil.
+- LOW: kleinere, nicht-zentrale Inkonsistenz.
+
+Antworte ausschließlich mit validem JSON, kein Freitext davor oder danach.
+"""
 
 OUTPUT_FORMAT = """Antworte ausschließlich mit einem JSON-Objekt exakt in dieser Struktur:
 
 {
 "is_meaningful": true,
 "is_supported": false,
-"severity": "MEDIUM",
-"reasoning": "kurze Begründung, 2-3 Sätze, benenne explizit die widersprüchlichen Stellen (z.B. 'Tabelle Zeile X sagt Phase 3: Nächster Schritt, Fazit Zeile Y sagt Alle Phasen bis Phase 8 sind abgeschlossen')",
-"contradiction_summary": "falls is_supported=false: was genau widerspricht sich (z.B. 'Phase 3 Status: Tabelle vs. Fazit'). Sonst leerer String."
+"severity": "HIGH",
+"reasoning": "kurze Begründung, 2-3 Sätze. Benenne die zwei konkreten Textstellen im Chunk.",
+"contradiction_summary": "falls is_supported=false: was genau widerspricht sich. Sonst leerer String."
 }"""
 
 @dataclass(frozen=True)
@@ -71,23 +99,16 @@ class FullAuditJudgePromptComponents:
     role: str = ROLE
     task_template: str = TASK_TEMPLATE
     constraints: str = CONSTRAINTS
-    severity_guidance: str = SEVERITY_GUIDANCE
     output_format: str = OUTPUT_FORMAT
 
 def build_full_audit_judge_prompt(
     filename: str,
     document_section_to_evaluate: str,
-    current_project_concept: str,
-    recent_worklog_summaries: str,
-    full_document_text: str,
     components: FullAuditJudgePromptComponents | None = None,
 ) -> str:
     components = components or FullAuditJudgePromptComponents()
     task = components.task_template.format(
         filename=filename,
-        document_section_to_evaluate=document_section_to_evaluate or "(kein Abschnitt verfügbar)",
-        full_document_text=full_document_text or "(kein Volltext verfügbar)",
-        current_project_concept=current_project_concept or "(kein Projektstand verfügbar)",
-        recent_worklog_summaries=recent_worklog_summaries or "(keine anderen Dokumente vorhanden)",
+        document_section_to_evaluate=document_section_to_evaluate,
     )
-    return "\n\n".join([components.role, task, components.constraints, components.severity_guidance, components.output_format])
+    return "\n\n".join([components.role, task, components.constraints, components.output_format])
